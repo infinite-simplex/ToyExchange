@@ -32,7 +32,7 @@ static inline uint64_t get_time() noexcept {
 constexpr std::size_t TELEMETRY_POOL_SIZE = 1'048'576; // 2^20
 static_assert((TELEMETRY_POOL_SIZE & (TELEMETRY_POOL_SIZE - 1)) == 0,
     "TELEMETRY_POOL_SIZE must be a power of 2 for trace_index()'s masking");
-inline alignas(64) OrderTrace g_telemetry_arena[TELEMETRY_POOL_SIZE];
+alignas(64) inline OrderTrace g_telemetry_arena[TELEMETRY_POOL_SIZE];
 
 // The single canonical way to turn a TraceId into an arena slot. Every
 // read/write of g_telemetry_arena must go through this — never index it
