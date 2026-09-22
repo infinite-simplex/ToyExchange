@@ -29,7 +29,7 @@ compile_commands.json
 *.vcxproj.user
 
 # Claude Code local session settings (machine/user-specific)
-.claude/settings.local.json
+.claude/
 
 # Ad hoc local run artifacts
 log.txt
