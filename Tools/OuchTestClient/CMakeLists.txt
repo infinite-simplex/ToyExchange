@@ -1,0 +1,2 @@
+add_executable(OuchTestClient main.cpp)
+target_link_libraries(OuchTestClient PRIVATE ExchangeCommon)
