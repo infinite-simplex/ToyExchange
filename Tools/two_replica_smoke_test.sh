@@ -103,17 +103,14 @@ echo "Sending orders..."
 # Price is a 0-100 scale in this engine (event-contract style pricing;
 # OrderBook's price levels array is sized [0,100] — see MAX_LEVELS in
 # MatchingService/OrderBook.hpp), so keep test prices in that range.
-"$CLIENT_BIN" --host 127.0.0.1 --port "$OUCH_PORT" --symbol TEST --side B --price 40 --qty 50
-"$CLIENT_BIN" --host 127.0.0.1 --port "$OUCH_PORT" --symbol TEST --side S --price 60 --qty 50
-# This third order crosses the resting ask on price, but every order in this
-# system currently carries firm_id=0 (no real account/firm assignment wired
-# up yet — see OrderBook::submit_order's create_order_from_command(cmd, 0)),
-# so self-trade prevention treats it as the same firm trading with itself and
-# rejects it rather than filling. That's expected today, not a test bug —
-# and it's a useful check in its own right: confirms a REJECTED event (with
-# the correct SELF_TRADING_PREVENTION reason code) makes it all the way back
-# to the client as a private OUCH ack, not just ACCEPTED ones.
-"$CLIENT_BIN" --host 127.0.0.1 --port "$OUCH_PORT" --symbol TEST --side B --price 60 --qty 30 --listen-ms 800
+#
+# Firm 1 rests a bid and firm 2 rests a (non-crossing) ask; firm 2's third
+# order then crosses firm 1's resting bid. Distinct --firm-id values are
+# required here — self-trade prevention would otherwise reject any order
+# that crosses one from the same firm (see OuchOrderCommand::firmId).
+"$CLIENT_BIN" --host 127.0.0.1 --port "$OUCH_PORT" --symbol TEST --side B --price 40 --qty 50 --firm-id 1
+"$CLIENT_BIN" --host 127.0.0.1 --port "$OUCH_PORT" --symbol TEST --side S --price 60 --qty 50 --firm-id 2
+"$CLIENT_BIN" --host 127.0.0.1 --port "$OUCH_PORT" --symbol TEST --side S --price 40 --qty 30 --firm-id 2 --listen-ms 800
 
 sleep 1.0
 

@@ -435,7 +435,7 @@ public:
             return;
         }
 
-        Order local_order = create_order_from_command(cmd, 0);
+        Order local_order = create_order_from_command(cmd);
         match_order(local_order);
 
         if (m_gtd_scheduler && cmd.orderType == ORDER_TYPE::GOOD_TILL_DAY && !local_order.is_filled()) {
@@ -472,12 +472,12 @@ private:
     AskBook m_ask_book;
     Clock m_matching_clock;
 
-    [[nodiscard]] Order create_order_from_command(const OuchOrderCommand& cmd, FirmId firm_id) noexcept {
+    [[nodiscard]] Order create_order_from_command(const OuchOrderCommand& cmd) noexcept {
         // Wire message kind (Enter/Cancel/Replace) decides CANCEL; only an
         // ENTER_ORDER's own orderType field decides the matching behavior.
         ORDER_TYPE type = (cmd.type == CommandType::CANCEL_ORDER) ? ORDER_TYPE::CANCEL : cmd.orderType;
         Order order(cmd.orderId,
-            firm_id,
+            cmd.firmId,
             cmd.buySellIndicator == 'B' ? SIDE::BID : SIDE::ASK,
             type,
             cmd.price,

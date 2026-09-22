@@ -25,10 +25,10 @@
 namespace {
 
 // [2B BE payloadLen][1B 'O'][14B token][1B side][1B orderType]
-// [4B BE shares][8B symbol][4B BE price]
+// [4B BE shares][8B symbol][4B BE price][4B BE firmId]
 std::vector<char> BuildOuchEnterOrderFrame(const char orderToken[14], char buySellIndicator,
-    uint32_t shares, const char symbol[8], uint32_t price, ORDER_TYPE orderType) {
-    constexpr size_t bodyLen = 14 + 1 + 1 + 4 + 8 + 4;
+    uint32_t shares, const char symbol[8], uint32_t price, ORDER_TYPE orderType, uint32_t firmId) {
+    constexpr size_t bodyLen = 14 + 1 + 1 + 4 + 8 + 4 + 4;
     constexpr uint16_t payloadLen = static_cast<uint16_t>(1 + bodyLen);
 
     std::vector<char> frame(2 + payloadLen);
@@ -48,6 +48,10 @@ std::vector<char> BuildOuchEnterOrderFrame(const char orderToken[14], char buySe
     frame[off++] = static_cast<char>((price >> 16) & 0xFF);
     frame[off++] = static_cast<char>((price >> 8) & 0xFF);
     frame[off++] = static_cast<char>(price & 0xFF);
+    frame[off++] = static_cast<char>((firmId >> 24) & 0xFF);
+    frame[off++] = static_cast<char>((firmId >> 16) & 0xFF);
+    frame[off++] = static_cast<char>((firmId >> 8) & 0xFF);
+    frame[off++] = static_cast<char>(firmId & 0xFF);
     return frame;
 }
 
@@ -164,6 +168,10 @@ void PrintUsage() {
         "  --price <0-255>        required (Price is uint8_t on the exchange side)\n"
         "  --qty <shares>         required\n"
         "  --order-type <type>    LIMIT (default) | IOC | FOK | GTC | GTD | MARKET\n"
+        "  --firm-id <n>          default 0. Self-trade prevention rejects two\n"
+        "                         orders sharing a firm id that would otherwise\n"
+        "                         cross each other — use different --firm-id\n"
+        "                         values across invocations to let them match.\n"
         "  --token <text>         default: auto-generated, unique per order sent\n"
         "  --count <n>            send n orders over one connection, default 1\n"
         "  --interval-ms <ms>     delay between sends when --count > 1, default 0\n"
@@ -182,6 +190,7 @@ int main(int argc, char** argv) {
     long price = -1;
     long qty = -1;
     ORDER_TYPE orderType = ORDER_TYPE::LIMIT;
+    uint32_t firmId = 0;
     std::string tokenOverride;
     int count = 1;
     int intervalMs = 0;
@@ -201,6 +210,7 @@ int main(int argc, char** argv) {
         else if (arg == "--price") price = std::stol(next());
         else if (arg == "--qty") qty = std::stol(next());
         else if (arg == "--order-type") orderType = ParseOrderType(next());
+        else if (arg == "--firm-id") firmId = static_cast<uint32_t>(std::stoul(next()));
         else if (arg == "--token") tokenOverride = next();
         else if (arg == "--count") count = std::stoi(next());
         else if (arg == "--interval-ms") intervalMs = std::stoi(next());
@@ -248,7 +258,7 @@ int main(int argc, char** argv) {
         }
 
         auto frame = BuildOuchEnterOrderFrame(token, side, static_cast<uint32_t>(qty), symbol,
-            static_cast<uint32_t>(price), orderType);
+            static_cast<uint32_t>(price), orderType, firmId);
 
         ssize_t sent = send(sock, frame.data(), frame.size(), 0);
         if (sent != static_cast<ssize_t>(frame.size())) {
@@ -258,7 +268,7 @@ int main(int argc, char** argv) {
         }
 
         std::cout << "Sent ENTER_ORDER: side=" << side << " price=" << price
-                  << " qty=" << qty << " symbol=" << symbolStr << "\n";
+                  << " qty=" << qty << " symbol=" << symbolStr << " firm_id=" << firmId << "\n";
 
         if (i + 1 < count && intervalMs > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));

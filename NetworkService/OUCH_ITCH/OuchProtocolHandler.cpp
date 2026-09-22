@@ -57,7 +57,7 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
 
     switch (msgType) {
     case 'O': { // ENTER_ORDER
-        constexpr size_t EXPECTED_BODY_LEN = 14 + 1 + 1 + 4 + 8 + 4;
+        constexpr size_t EXPECTED_BODY_LEN = 14 + 1 + 1 + 4 + 8 + 4 + 4;
         if (bodyLen != EXPECTED_BODY_LEN) {
             return 0; // FLAG: malformed — see NOTE above
         }
@@ -93,6 +93,9 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
         outCmd.price = readBE32(body + off);
         off += 4;
 
+        outCmd.firmId = readBE32(body + off);
+        off += 4;
+
         outCmd.orderId = m_nextOrderId++;
         m_orderTokenRegistry.insert(outCmd.orderToken, outCmd.orderId);
 
@@ -122,6 +125,7 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
         outCmd.price = 0;
         outCmd.stockLocate = 0;
         outCmd.buySellIndicator = '\0';
+        outCmd.firmId = 0;
         outCmd.type = CommandType::CANCEL_ORDER;
         return totalFrameLen;
     }
@@ -145,6 +149,7 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
 
         outCmd.stockLocate = 0;
         outCmd.buySellIndicator = '\0';
+        outCmd.firmId = 0;
         outCmd.type = CommandType::REPLACE_ORDER;
         return totalFrameLen;
     }

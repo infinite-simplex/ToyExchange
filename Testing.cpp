@@ -986,10 +986,15 @@ namespace {
 
 // Builds an OUCH ENTER_ORDER ('O') frame matching OuchProtocolHandler's
 // expected wire layout: [2B BE payloadLen][1B 'O'][14B token][1B side]
-// [1B orderType][4B BE shares][8B symbol][4B BE price].
+// [1B orderType][4B BE shares][8B symbol][4B BE price][4B BE firmId].
+// firmId defaults to 0 so existing call sites (which predate firmId and
+// implicitly rely on every OUCH order sharing the same firm) don't need to
+// change; pass distinct firmIds to exercise cross-firm matching instead of
+// tripping self-trade prevention.
 std::vector<char> BuildOuchEnterOrderFrame(const char orderToken[14], char buySellIndicator,
-    uint32_t shares, const char symbol[8], uint32_t price, ORDER_TYPE orderType = ORDER_TYPE::LIMIT) {
-    constexpr size_t bodyLen = 14 + 1 + 1 + 4 + 8 + 4;
+    uint32_t shares, const char symbol[8], uint32_t price, ORDER_TYPE orderType = ORDER_TYPE::LIMIT,
+    uint32_t firmId = 0) {
+    constexpr size_t bodyLen = 14 + 1 + 1 + 4 + 8 + 4 + 4;
     constexpr uint16_t payloadLen = static_cast<uint16_t>(1 + bodyLen);
 
     std::vector<char> frame(2 + payloadLen);
@@ -1009,6 +1014,10 @@ std::vector<char> BuildOuchEnterOrderFrame(const char orderToken[14], char buySe
     frame[off++] = static_cast<char>((price >> 16) & 0xFF);
     frame[off++] = static_cast<char>((price >> 8) & 0xFF);
     frame[off++] = static_cast<char>(price & 0xFF);
+    frame[off++] = static_cast<char>((firmId >> 24) & 0xFF);
+    frame[off++] = static_cast<char>((firmId >> 16) & 0xFF);
+    frame[off++] = static_cast<char>((firmId >> 8) & 0xFF);
+    frame[off++] = static_cast<char>(firmId & 0xFF);
     return frame;
 }
 
@@ -1059,7 +1068,7 @@ TEST(NetworkIngressPipelineTest, GatewayToReceiverDeliversParsedOrderOverLoopbac
 
     const char orderToken[14] = "TESTTOKEN0001";
     const char symbol[8] = { 'T', 'E', 'S', 'T', ' ', ' ', ' ', ' ' };
-    auto frame = BuildOuchEnterOrderFrame(orderToken, 'B', 100, symbol, 42);
+    auto frame = BuildOuchEnterOrderFrame(orderToken, 'B', 100, symbol, 42, ORDER_TYPE::LIMIT, 7);
     ASSERT_EQ(static_cast<ssize_t>(frame.size()),
         send(clientFd, frame.data(), frame.size(), 0));
     close(clientFd);
@@ -1073,8 +1082,73 @@ TEST(NetworkIngressPipelineTest, GatewayToReceiverDeliversParsedOrderOverLoopbac
     EXPECT_EQ(Quantity(100), received.shares);
     EXPECT_EQ(Price(42), received.price);
     EXPECT_EQ(expectedStockLocate, received.stockLocate);
+    EXPECT_EQ(FirmId(7), received.firmId);
     EXPECT_EQ(0, std::memcmp(orderToken, received.orderToken, 14));
 
+    receiver.stop();
+    gateway.stop();
+}
+
+TEST(NetworkIngressPipelineTest, DistinctFirmIdsAllowOuchOrdersToMatch) {
+    SymbolRegistry registry;
+    registry.registerSymbol("TEST");
+    OrderTokenRegistry orderTokenRegistry;
+    OuchProtocolHandler handler(registry, orderTokenRegistry);
+
+    NetworkConfig config;
+    config.ouchListenPort = 15105;
+    config.multicastIp = "239.255.0.5";
+    config.multicastPort = 25105;
+
+    NetworkGateway<OuchProtocolHandler, OuchOrderCommand> gateway(
+        handler, config, "/tmp/eceo_test_seq_store_firmid.dat", 1024);
+    gateway.start();
+
+    SPSCQueue<OuchOrderCommand> inboundQueue;
+    MulticastIngressReceiver<OuchOrderCommand> receiver(inboundQueue, config);
+    receiver.start();
+
+    SPSCQueue<OrderEvent, 16384> eventQ;
+    SPSCQueue<OrderTrace, 16384> traceQ;
+    SPSCProducerPolicy policy{ eventQ, traceQ };
+    OrderBook<SPSCProducerPolicy> lob{ policy };
+
+    MatchingService<OuchOrderCommand> matchingService(inboundQueue, lob);
+    matchingService.start();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    auto sendFrame = [&](const std::vector<char>& frame) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in serverAddr{};
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_port = htons(config.ouchListenPort);
+        inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
+        ASSERT_EQ(0, connect(fd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
+        ASSERT_EQ(static_cast<ssize_t>(frame.size()), send(fd, frame.data(), frame.size(), 0));
+        close(fd);
+    };
+
+    const char symbol[8] = { 'T', 'E', 'S', 'T', ' ', ' ', ' ', ' ' };
+    const char askToken[14] = "FIRMIDASK0001";
+    const char bidToken[14] = "FIRMIDBID0001";
+
+    // Resting ask from firm 1, crossed by a bid from firm 2 — distinct firm
+    // ids, so self-trade prevention must not block this (see OuchOrderCommand
+    // ::firmId and OrderBook::create_order_from_command).
+    sendFrame(BuildOuchEnterOrderFrame(askToken, 'S', 50, symbol, 40, ORDER_TYPE::LIMIT, 1));
+    sendFrame(BuildOuchEnterOrderFrame(bidToken, 'B', 50, symbol, 40, ORDER_TYPE::LIMIT, 2));
+
+    OrderEvent evt{};
+    bool sawExecuted = false;
+    for (int i = 0; i < 4 && !sawExecuted; ++i) {
+        ASSERT_TRUE(WaitForPop(eventQ, evt)) << "Expected events never arrived";
+        if (evt.type == OrderEventType::EXECUTED) sawExecuted = true;
+    }
+    EXPECT_TRUE(sawExecuted) << "Distinct-firm orders should match instead of "
+                                 "hitting self-trade prevention";
+
+    matchingService.stop();
     receiver.stop();
     gateway.stop();
 }
@@ -1189,13 +1263,10 @@ TEST(NetworkIngressPipelineTest, TelemetryIsCapturedConsistentlyAcrossStages) {
     ASSERT_EQ(0, connect(clientFd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
 
     // NOTE: on_trace_complete only fires when an order is *evicted* from the
-    // book (fully filled or canceled), and OrderBook::create_order_from_command
-    // hardcodes every OUCH order's firm_id to 0 — so self-trade prevention
-    // blocks any two OUCH orders from ever matching each other. That's a
-    // pre-existing gap, out of scope here. So this test reads the arena
-    // directly rather than relying on eviction: this is the only order
-    // NetworkGateway will parse in this test, so its trace_id is
-    // deterministically sequence 0.
+    // book (fully filled or canceled); a lone resting ACCEPTED order never
+    // triggers it. So this test reads the arena directly rather than relying
+    // on eviction: this is the only order NetworkGateway will parse in this
+    // test, so its trace_id is deterministically sequence 0.
     const char orderToken[14] = "TELEMTOKEN001";
     const char symbol[8] = { 'T', 'E', 'S', 'T', ' ', ' ', ' ', ' ' };
     auto frame = BuildOuchEnterOrderFrame(orderToken, 'B', 50, symbol, 30);

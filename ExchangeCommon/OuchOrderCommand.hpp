@@ -14,6 +14,9 @@ enum class CommandType : uint8_t {
 struct OuchOrderCommand {
     TraceId     trace_id;           // Token to track this specific execution
     SessionId   sessionId;          // Owning connection, stamped by NetworkGateway at parse time — see Alias.hpp
+    FirmId      firmId;             // ENTER_ORDER only: client-supplied, drives self-trade prevention.
+                                     // CANCEL/REPLACE leave this at 0 (unused; the target order's own
+                                     // firm_id, stored on the resting Order, is what matters for those).
     OrderId     orderId;            // ENTER_ORDER: freshly assigned by OuchProtocolHandler.
                                      // CANCEL_ORDER: resolved from orderToken via OrderTokenRegistry
                                      // (INVALID_ORDER_ID if the token isn't known).
