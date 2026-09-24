@@ -9,6 +9,8 @@
 #include "GtdCancelService.hpp"
 #include "NetworkConfig.hpp"
 #include "OuchOrderCommand.hpp"
+#include "HeartbeatMessage.hpp"
+#include "ReplicaArbiter.hpp"
 #include <IGoodTillDayScheduler.hpp>
 #include <vector>
 #include <cstring>
@@ -1365,4 +1367,120 @@ TEST(NetworkIngressPipelineTest, GtdCancelServiceFiresScheduledCancelWithinBound
     matchingService.stop();
     receiver.stop();
     gateway.stop();
+}
+
+// =====================================================================
+// ReplicaArbiter — matching-replica leader election / fencing
+// =====================================================================
+
+namespace {
+
+HeartbeatResponse SendHeartbeat(uint16_t arbiterPort, ReplicaId id, uint64_t lastAppliedSeq) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    timeval rxTimeout{};
+    rxTimeout.tv_sec = 0;
+    rxTimeout.tv_usec = 500'000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rxTimeout, sizeof(rxTimeout));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(arbiterPort);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+    HeartbeatRequest req{ id, lastAppliedSeq };
+    sendto(sock, &req, sizeof(req), 0, (sockaddr*)&addr, sizeof(addr));
+
+    HeartbeatResponse resp{};
+    recv(sock, &resp, sizeof(resp), 0);
+    close(sock);
+    return resp;
+}
+
+} // namespace
+
+TEST(ReplicaArbiterTest, FirstEverHeartbeatBecomesLeaderWithEpochOne) {
+    ReplicaArbiter arbiter(46001, std::chrono::milliseconds(50));
+    arbiter.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    auto resp = SendHeartbeat(46001, 5, 0);
+
+    EXPECT_EQ(ReplicaId(5), resp.leaderId);
+    EXPECT_EQ(FencingEpoch(1), resp.epoch); // NO_EPOCH (0) -> 1 on the very first election
+
+    arbiter.stop();
+}
+
+TEST(ReplicaArbiterTest, StickyLeadershipDoesNotReclaim) {
+    ReplicaArbiter arbiter(46002, std::chrono::milliseconds(50));
+    arbiter.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    // Replica 2 heartbeats alone first and becomes leader.
+    auto first = SendHeartbeat(46002, 2, 0);
+    EXPECT_EQ(ReplicaId(2), first.leaderId);
+
+    // Replica 1 (lower id) shows up shortly after, while 2 is still fresh.
+    // Sticky: leader must stay 2, and the epoch must NOT bump — a lower id
+    // reappearing is not itself a leadership change.
+    auto second = SendHeartbeat(46002, 1, 0);
+    EXPECT_EQ(ReplicaId(2), second.leaderId);
+    EXPECT_EQ(first.epoch, second.epoch);
+
+    arbiter.stop();
+}
+
+TEST(ReplicaArbiterTest, EpochBumpsWhenLeaderFailsOver) {
+    ReplicaArbiter arbiter(46003, std::chrono::milliseconds(30));
+    arbiter.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    auto first = SendHeartbeat(46003, 1, 0);
+    EXPECT_EQ(ReplicaId(1), first.leaderId);
+
+    // Let replica 1 go stale (stop heartbeating) past the staleness window;
+    // replica 2 checking in afterward should take over with a higher epoch.
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    auto second = SendHeartbeat(46003, 2, 0);
+
+    EXPECT_EQ(ReplicaId(2), second.leaderId);
+    EXPECT_GT(second.epoch, first.epoch);
+
+    arbiter.stop();
+}
+
+TEST(ReplicaArbiterTest, LowestIdWinsAmongEligibleCandidatesOnFailover) {
+    ReplicaArbiter arbiter(46004, std::chrono::milliseconds(150));
+    arbiter.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    // Replica 3 becomes leader alone first.
+    auto initial = SendHeartbeat(46004, 3, 0);
+    EXPECT_EQ(ReplicaId(3), initial.leaderId);
+
+    // Replicas 1 and 2 check in while 3 is still comfortably fresh — both
+    // become known to the arbiter, but sticky leadership keeps 3 in charge
+    // (recompute happens per-request using ALL tracked replicas' last known
+    // status, not just the requester's — this is what makes the eventual
+    // tie-break below possible: replica 1's freshness here persists in the
+    // arbiter's map even though a later, different replica's heartbeat is
+    // what actually triggers noticing 3 went stale).
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    auto stillSticky1 = SendHeartbeat(46004, 1, 0);
+    auto stillSticky2 = SendHeartbeat(46004, 2, 0);
+    EXPECT_EQ(ReplicaId(3), stillSticky1.leaderId);
+    EXPECT_EQ(ReplicaId(3), stillSticky2.leaderId);
+
+    // Replica 3 goes silent for good. Once its staleness window elapses,
+    // replica 2 re-checks in (refreshing only itself) — replica 1's earlier
+    // check-in above is still well within the staleness window at this
+    // point, so both 1 and 2 are eligible, and the lowest id should win
+    // regardless of which one's request triggered this recompute.
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    auto afterFailover = SendHeartbeat(46004, 2, 0);
+
+    EXPECT_EQ(ReplicaId(1), afterFailover.leaderId);
+    EXPECT_GT(afterFailover.epoch, initial.epoch);
+
+    arbiter.stop();
 }

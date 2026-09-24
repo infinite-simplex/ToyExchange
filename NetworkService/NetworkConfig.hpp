@@ -37,6 +37,12 @@ struct NetworkConfig {
     std::string egressMulticastIp = "239.10.10.20";
     uint16_t egressMulticastPort = 30002;
 
+    // Matching-replica leader arbitration: NetworkGateway's ReplicaArbiter
+    // listens here for replica heartbeats and replies with the current
+    // {epoch, leaderId} — see NetworkService/Arbitration/. Only one replica
+    // is allowed to actually publish egress at a time.
+    uint16_t arbitrationPort = 40003;
+
     // Pre-configured authorized traders
     std::vector<ClientSessionConfig> authorizedClients;
 };

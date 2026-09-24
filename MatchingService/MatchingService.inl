@@ -38,5 +38,6 @@ void MatchingService<TCommand>::poll() {
 		//we have an inbound command, send to the orderbook
 		m_lob.submit_order(cmd);
 		trace.match_done_tsc = get_time();
+		m_lastAppliedSeq.store(cmd.trace_id, std::memory_order_relaxed);
 	}
 }

@@ -1,4 +1,6 @@
+#include "Alias.hpp"
 #include "EgressPublisher.hpp"
+#include "LeaderHeartbeatClient.hpp"
 #include "MatchingService.hpp"
 #include "MulticastIngressReceiver.hpp"
 #include "NetworkConfig.hpp"
@@ -23,6 +25,7 @@ namespace {
 int main(int argc, char** argv) {
     NetworkConfig config;
     std::string replicaId = "replica-1";
+    ReplicaId numericReplicaId = INVALID_REPLICA_ID;
     int statsIntervalMs = 0; // 0 = disabled; opt in for local debugging/smoke tests
 
     for (int i = 1; i < argc; ++i) {
@@ -40,10 +43,18 @@ int main(int argc, char** argv) {
         else if (arg == "--stats-interval-ms") statsIntervalMs = std::stoi(next());
         else if (arg == "--egress-ip") config.egressMulticastIp = next();
         else if (arg == "--egress-port") config.egressMulticastPort = static_cast<uint16_t>(std::stoi(next()));
+        else if (arg == "--replica-id") numericReplicaId = static_cast<ReplicaId>(std::stoi(next()));
+        else if (arg == "--arbitration-port") config.arbitrationPort = static_cast<uint16_t>(std::stoi(next()));
         else {
             std::cerr << "Unknown argument: " << arg << "\n";
             return 1;
         }
+    }
+
+    if (numericReplicaId == INVALID_REPLICA_ID) {
+        std::cerr << "--replica-id <n> is required (n > 0) — identifies this replica "
+                     "to the gateway's leader arbitration, see NetworkService/Arbitration/\n";
+        return 1;
     }
 
     std::signal(SIGINT, handleSignal);
@@ -69,22 +80,34 @@ int main(int argc, char** argv) {
     OrderBook<SPSCProducerPolicy> book(policy);
     MatchingService<OuchOrderCommand> matcher(*inboundQueue, book);
     MulticastIngressReceiver<OuchOrderCommand> receiver(*inboundQueue, config);
-    EgressPublisher<OrderEvent, 16384> egressPublisher(*eventQueue, config);
 
-    std::cout << "MatchingService[" << replicaId << "] starting: joining "
+    // Tells the gateway's ReplicaArbiter this replica is alive and how far
+    // it's gotten, and learns back who's currently allowed to publish —
+    // EgressPublisher only sends when this replica believes itself leader.
+    LeaderHeartbeatClient<MatchingService<OuchOrderCommand>> heartbeatClient(
+        numericReplicaId, matcher, config);
+    EgressPublisher<OrderEvent, 16384, LeaderHeartbeatClient<MatchingService<OuchOrderCommand>>>
+        egressPublisher(*eventQueue, config, heartbeatClient);
+
+    std::cout << "MatchingService[" << replicaId << "] (replica-id " << numericReplicaId
+              << ") starting: joining "
               << config.multicastIp << ":" << config.multicastPort
               << ", retransmit via " << config.retransmitServerIp << ":" << config.retransmitServerPort
-              << ", egress to " << config.egressMulticastIp << ":" << config.egressMulticastPort << "\n";
+              << ", egress to " << config.egressMulticastIp << ":" << config.egressMulticastPort
+              << ", arbitration via " << config.retransmitServerIp << ":" << config.arbitrationPort << "\n";
 
     receiver.start();
     matcher.start();
+    heartbeatClient.start();
     egressPublisher.start();
 
     if (statsIntervalMs > 0) {
         while (!g_shutdownRequested.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(statsIntervalMs));
             std::cout << "[" << replicaId << "] best bid=" << static_cast<int>(book.get_best_bid())
-                      << " best ask=" << static_cast<int>(book.get_best_ask()) << "\n";
+                      << " best ask=" << static_cast<int>(book.get_best_ask())
+                      << " leader=" << (heartbeatClient.isLeader() ? "yes" : "no")
+                      << " epoch=" << heartbeatClient.currentEpoch() << "\n";
         }
     } else {
         while (!g_shutdownRequested.load(std::memory_order_relaxed)) {
@@ -94,6 +117,7 @@ int main(int argc, char** argv) {
 
     std::cout << "MatchingService[" << replicaId << "] shutting down...\n";
     egressPublisher.stop();
+    heartbeatClient.stop();
     matcher.stop();
     receiver.stop();
     return 0;

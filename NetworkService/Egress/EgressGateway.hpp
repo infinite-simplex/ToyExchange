@@ -1,6 +1,8 @@
 #pragma once
+#include "FencedMessage.hpp"
 #include "NetworkConfig.hpp"
 #include "OrderEventFrame.hpp"
+#include "ReplicaArbiter.hpp"
 
 #include <atomic>
 #include <cstring>
@@ -13,7 +15,11 @@
 
 // Runs inside NetworkServiceApp: joins the internal egress multicast channel
 // (see NetworkConfig::egressMulticastIp/Port) that every MatchingServiceApp
-// replica's EgressPublisher writes to, and for each OrderEvent received:
+// replica's EgressPublisher writes to, and for each FencedMessage<TEvent>
+// received:
+//   - drops it if its epoch is stale (see ReplicaArbiter — this is what
+//     actually makes a failed-over-away-from replica's late traffic
+//     harmless, rather than requiring it to notice its own demotion)
 //   - prints it to console (stand-in for a real market-data/ack consumer
 //     while there's no client that can fully decode the wire frame yet)
 //   - sends a private OUCH-style ack back over the originating client's own
@@ -27,8 +33,8 @@
 template <typename TGateway, typename TEvent>
 class EgressGateway {
 public:
-    EgressGateway(TGateway& gateway, const NetworkConfig& config)
-        : m_gateway(gateway), m_config(config) {
+    EgressGateway(TGateway& gateway, const NetworkConfig& config, const ReplicaArbiter& arbiter)
+        : m_gateway(gateway), m_config(config), m_arbiter(arbiter) {
     }
 
     ~EgressGateway() { stop(); }
@@ -81,10 +87,15 @@ public:
 private:
     void rxLoop() {
         while (m_running.load(std::memory_order_relaxed)) {
-            TEvent evt{};
-            ssize_t len = recv(m_rxFd, &evt, sizeof(evt), 0);
-            if (len != static_cast<ssize_t>(sizeof(evt))) continue;
+            FencedMessage<TEvent> msg{};
+            ssize_t len = recv(m_rxFd, &msg, sizeof(msg), 0);
+            if (len != static_cast<ssize_t>(sizeof(msg))) continue;
 
+            // Zero-latency, in-process check — no network round trip needed
+            // since the arbiter that decided this epoch lives right here.
+            if (msg.epoch < m_arbiter.currentEpoch()) continue; // stale, from a deposed leader
+
+            const TEvent& evt = msg.payload;
             printEvent(evt);
 
             auto frame = EncodeOrderEventFrame(evt);
@@ -115,6 +126,7 @@ private:
 
     TGateway& m_gateway;
     NetworkConfig m_config;
+    const ReplicaArbiter& m_arbiter;
     std::atomic<bool> m_running{ false };
     std::thread m_worker;
     int m_rxFd{ -1 };

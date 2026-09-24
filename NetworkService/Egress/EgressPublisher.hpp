@@ -1,4 +1,5 @@
 #pragma once
+#include "FencedMessage.hpp"
 #include "SPSCQueue.hpp"
 #include "NetworkConfig.hpp"
 
@@ -11,19 +12,21 @@
 #include <unistd.h>
 
 // Runs inside MatchingServiceApp: drains the matching engine's own output
-// queue (SPSCProducerPolicy's event queue) and multicasts each raw T (e.g.
-// OrderEvent) to NetworkConfig::egressMulticastIp/Port, where every
-// NetworkServiceApp's EgressGateway picks it up to derive the private OUCH
-// ack and public ITCH broadcast. Deliberately simple for now: no gap-fill/
-// retransmit on this channel (unlike the ingress replication channel), and
-// every replica publishes independently — with more than one active replica
-// the same event is published once per replica until leader election exists
-// (m_isLeader below is the seam for that, currently hardcoded on).
-template <typename T, size_t Capacity = 1024>
+// queue (SPSCProducerPolicy's event queue) and multicasts each item, wrapped
+// in a FencedMessage<T>, to NetworkConfig::egressMulticastIp/Port, where
+// every NetworkServiceApp's EgressGateway picks it up to derive the private
+// OUCH ack and public ITCH broadcast. Deliberately simple for now: no
+// gap-fill/retransmit on this channel (unlike the ingress replication
+// channel). Only the replica the heartbeat client currently believes is
+// leader actually sends — see LeaderHeartbeatClient — so with more than one
+// active replica, exactly one of them publishes at a time instead of every
+// replica publishing independently.
+template <typename T, size_t Capacity, typename THeartbeatClient>
 class EgressPublisher {
 public:
-    EgressPublisher(SPSCQueue<T, Capacity>& sourceQueue, const NetworkConfig& config)
-        : m_sourceQueue(sourceQueue), m_config(config) {
+    EgressPublisher(SPSCQueue<T, Capacity>& sourceQueue, const NetworkConfig& config,
+                     const THeartbeatClient& heartbeatClient)
+        : m_sourceQueue(sourceQueue), m_config(config), m_heartbeatClient(heartbeatClient) {
     }
 
     ~EgressPublisher() { stop(); }
@@ -54,17 +57,18 @@ public:
 
 private:
     void publishLoop() {
-        // TODO: gate on leader status once replica leader election exists —
-        // a passive replica should still drain its queue (so it doesn't
-        // back up/stall the matching thread) but skip the actual sendto().
         while (m_running.load(std::memory_order_relaxed)) {
             T item;
             if (!m_sourceQueue.try_pop(item)) {
                 std::this_thread::yield();
                 continue;
             }
-            if (m_isLeader) {
-                sendto(m_udpFd, &item, sizeof(item), 0,
+            // Always drain the queue regardless of leadership, so a passive
+            // replica's matching thread never backs up waiting on this one —
+            // only the actual sendto() is conditional.
+            if (m_heartbeatClient.isLeader()) {
+                FencedMessage<T> msg{ m_heartbeatClient.currentEpoch(), m_heartbeatClient.myId(), item };
+                sendto(m_udpFd, &msg, sizeof(msg), 0,
                     (struct sockaddr*)&m_destAddr, sizeof(m_destAddr));
             }
         }
@@ -72,9 +76,9 @@ private:
 
     SPSCQueue<T, Capacity>& m_sourceQueue;
     NetworkConfig m_config;
+    const THeartbeatClient& m_heartbeatClient;
     std::atomic<bool> m_running{ false };
     std::thread m_worker;
     int m_udpFd{ -1 };
     sockaddr_in m_destAddr{};
-    bool m_isLeader{ true }; // stub — always publish until leader election exists
 };

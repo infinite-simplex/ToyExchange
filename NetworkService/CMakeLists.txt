@@ -19,6 +19,7 @@ target_include_directories(NetworkService PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/Egress
     ${CMAKE_CURRENT_SOURCE_DIR}/OUCH_ITCH
     ${CMAKE_CURRENT_SOURCE_DIR}/GPU_PROT
+    ${CMAKE_CURRENT_SOURCE_DIR}/Arbitration
 )
 
 # Private linkage means it consumes ExchangeCommon internally

@@ -1,5 +1,6 @@
 #include "EgressGateway.hpp"
 #include "NetworkGateway.hpp"
+#include "ReplicaArbiter.hpp"
 #include "RetransmitServer.hpp"
 #include "OuchProtocolHandler.hpp"
 #include "OrderEvent.hpp"
@@ -44,6 +45,7 @@ int main(int argc, char** argv) {
         else if (arg == "--egress-port") config.egressMulticastPort = static_cast<uint16_t>(std::stoi(next()));
         else if (arg == "--itch-ip") config.itchMulticastGroup = next();
         else if (arg == "--itch-port") config.itchMulticastPort = static_cast<uint16_t>(std::stoi(next()));
+        else if (arg == "--arbitration-port") config.arbitrationPort = static_cast<uint16_t>(std::stoi(next()));
         else {
             std::cerr << "Unknown argument: " << arg << "\n";
             return 1;
@@ -78,20 +80,26 @@ int main(int argc, char** argv) {
     RetransmitServer<OuchOrderCommand> retransmitServer(
         gateway.sequenceStore(), config.retransmitServerPort);
 
+    // Arbitrates which MatchingService replica may currently publish egress
+    // (see NetworkService/Arbitration/); EgressGateway fences on its epoch.
+    ReplicaArbiter arbiter(config.arbitrationPort);
+
     EgressGateway<NetworkGateway<OuchProtocolHandler, OuchOrderCommand>, OrderEvent> egressGateway(
-        gateway, config);
+        gateway, config, arbiter);
 
     std::cout << "NetworkService starting: OUCH listen :" << config.ouchListenPort
               << ", replication multicast " << config.multicastIp << ":" << config.multicastPort
               << ", retransmit :" << config.retransmitServerPort
               << ", egress from " << config.egressMulticastIp << ":" << config.egressMulticastPort
               << ", ITCH broadcast " << config.itchMulticastGroup << ":" << config.itchMulticastPort
+              << ", arbitration :" << config.arbitrationPort
               << ", symbols:";
     for (const auto& symbol : symbols) std::cout << " " << symbol;
     std::cout << "\n";
 
     gateway.start();
     retransmitServer.start();
+    arbiter.start();
     egressGateway.start();
 
     while (!g_shutdownRequested.load(std::memory_order_relaxed)) {
@@ -100,6 +108,7 @@ int main(int argc, char** argv) {
 
     std::cout << "NetworkService shutting down...\n";
     egressGateway.stop();
+    arbiter.stop();
     retransmitServer.stop();
     gateway.stop();
     return 0;
