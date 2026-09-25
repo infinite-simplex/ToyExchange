@@ -1,5 +1,6 @@
 #include "Alias.hpp"
 #include "EgressPublisher.hpp"
+#include "GtdCancelService.hpp"
 #include "LeaderHeartbeatClient.hpp"
 #include "MatchingService.hpp"
 #include "MulticastIngressReceiver.hpp"
@@ -94,6 +95,17 @@ int main(int argc, char** argv) {
         egressPublisher(*eventQueue, config, heartbeatClient);
     TelemetryForwarder<16384> telemetryForwarder(*traceQueue, config, numericReplicaId);
 
+    // Wired in after heartbeatClient (which it needs, for the same
+    // leader-gating reason EgressPublisher uses it) rather than passed to
+    // OrderBook's own constructor — book must exist before heartbeatClient
+    // does (matcher, which heartbeatClient needs, needs book), so the
+    // scheduler can only be wired in via set_gtd_scheduler once everything
+    // exists. Still happens before matcher.start(), so no command can ever
+    // reach the book with the scheduler unset.
+    GtdCancelService<LeaderHeartbeatClient<MatchingService<OuchOrderCommand>>>
+        gtdCancelService(config, heartbeatClient);
+    book.set_gtd_scheduler(&gtdCancelService);
+
     std::cout << "MatchingService[" << replicaId << "] (replica-id " << numericReplicaId
               << ") starting: joining "
               << config.multicastIp << ":" << config.multicastPort
@@ -107,6 +119,7 @@ int main(int argc, char** argv) {
     heartbeatClient.start();
     egressPublisher.start();
     telemetryForwarder.start();
+    gtdCancelService.start();
 
     if (statsIntervalMs > 0) {
         while (!g_shutdownRequested.load(std::memory_order_relaxed) && !receiver.hitUnrecoverableGap()) {
@@ -140,6 +153,7 @@ int main(int argc, char** argv) {
     matcher.stop();
     telemetryForwarder.stop();
     egressPublisher.stop();
+    gtdCancelService.stop();
     heartbeatClient.stop();
     receiver.stop();
     return receiver.hitUnrecoverableGap() ? 2 : 0;

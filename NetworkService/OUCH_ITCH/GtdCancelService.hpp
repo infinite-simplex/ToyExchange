@@ -25,9 +25,20 @@ struct ScheduledCancel {
 // CANCEL_ORDER frame over a persistent TCP connection to NetworkGateway's own
 // OUCH listen port, exactly as a real client would — reusing the entire
 // existing pipeline (durability, sequencing, trace_id, telemetry) for free.
+//
+// Every replica runs its own instance and independently receives the same
+// schedule_cancel calls (each replica's OrderBook processes the identical
+// replicated command stream), so like EgressPublisher, only the replica
+// THeartbeatClient currently believes is leader actually sends — otherwise
+// every replica would fire its own redundant CANCEL_ORDER for the same
+// order. A non-leader replica still pops its due entries, just without
+// sending; whichever replica is (or becomes) leader has the identical entry
+// in its own heap.
+template <typename THeartbeatClient>
 class GtdCancelService : public IGoodTillDayScheduler {
 public:
-    explicit GtdCancelService(const NetworkConfig& config) : m_config(config) {}
+    GtdCancelService(const NetworkConfig& config, const THeartbeatClient& heartbeatClient)
+        : m_config(config), m_heartbeatClient(heartbeatClient) {}
     ~GtdCancelService() { stop(); }
 
     void start() {
@@ -69,7 +80,9 @@ private:
 
             auto now = std::chrono::system_clock::now();
             while (!m_heap.empty() && m_heap.top().cancelAt <= now) {
-                send_cancel(m_heap.top().orderToken);
+                if (m_heartbeatClient.isLeader()) {
+                    send_cancel(m_heap.top().orderToken);
+                }
                 m_heap.pop();
             }
 
@@ -122,6 +135,7 @@ private:
     }
 
     NetworkConfig m_config;
+    const THeartbeatClient& m_heartbeatClient;
     SPSCQueue<ScheduledCancel, 4096> m_scheduleQueue;
     std::priority_queue<ScheduledCancel, std::vector<ScheduledCancel>, ByCancelTimeAscending> m_heap;
     std::atomic<bool> m_running{ false };

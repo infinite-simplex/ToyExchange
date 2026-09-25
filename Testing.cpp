@@ -2220,6 +2220,18 @@ TEST(NetworkIngressPipelineTest, TelemetryIsCapturedConsistentlyAcrossStages) {
     gateway.stop();
 }
 
+namespace {
+
+// Stands in for LeaderHeartbeatClient's isLeader() (duck-typed, matching
+// GtdCancelService's THeartbeatClient template parameter) without needing a
+// real heartbeat round-trip against a ReplicaArbiter.
+struct FakeLeaderCheck {
+    bool leader{ true };
+    bool isLeader() const { return leader; }
+};
+
+} // namespace
+
 TEST(NetworkIngressPipelineTest, GtdCancelServiceFiresScheduledCancelWithinBoundedWindow) {
     SymbolRegistry registry;
     registry.registerSymbol("TEST");
@@ -2250,8 +2262,11 @@ TEST(NetworkIngressPipelineTest, GtdCancelServiceFiresScheduledCancelWithinBound
     // The service itself is just another OUCH TCP client of this same
     // gateway — no wiring to OrderBook's own GTD hook needed for this test
     // (that's covered by GoodTillDayTest); here we exercise its real
-    // heap/poll/TCP-send machinery end to end.
-    GtdCancelService gtdCancelService(config);
+    // heap/poll/TCP-send machinery end to end. FakeLeaderCheck defaults to
+    // leader=true, so this test isn't exercising the gating itself — see
+    // GtdCancelServiceDoesNotFireWhenNotLeader for that.
+    FakeLeaderCheck fakeLeader;
+    GtdCancelService<FakeLeaderCheck> gtdCancelService(config, fakeLeader);
     gtdCancelService.start();
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -2288,6 +2303,98 @@ TEST(NetworkIngressPipelineTest, GtdCancelServiceFiresScheduledCancelWithinBound
         << "GtdCancelService never fired the scheduled cancel within the bounded window";
     EXPECT_EQ(OrderEventType::CANCELED, canceled.type);
     EXPECT_EQ(accepted.order_id, canceled.order_id);
+
+    gtdCancelService.stop();
+    matchingService.stop();
+    receiver.stop();
+    gateway.stop();
+}
+
+TEST(NetworkIngressPipelineTest, GtdCancelServiceDoesNotFireWhenNotLeader) {
+    SymbolRegistry registry;
+    registry.registerSymbol("TEST");
+    OrderTokenRegistry orderTokenRegistry;
+    OuchProtocolHandler handler(registry, orderTokenRegistry);
+
+    NetworkConfig config;
+    config.ouchListenPort = 15115;
+    config.multicastIp = "239.255.0.18";
+    config.multicastPort = 25118;
+
+    NetworkGateway<OuchProtocolHandler, OuchOrderCommand> gateway(
+        handler, config, "/tmp/eceo_test_seq_store_gtd_notleader.dat", 1024);
+    gateway.start();
+
+    SPSCQueue<OuchOrderCommand> inboundQueue;
+    MulticastIngressReceiver<OuchOrderCommand> receiver(inboundQueue, config);
+    receiver.start();
+
+    SPSCQueue<OrderEvent, 16384> eventQ;
+    SPSCQueue<OrderTrace, 16384> traceQ;
+    SPSCProducerPolicy policy{ eventQ, traceQ };
+    OrderBook<SPSCProducerPolicy> lob{ policy };
+
+    MatchingService<OuchOrderCommand> matchingService(inboundQueue, lob);
+    matchingService.start();
+
+    FakeLeaderCheck fakeLeader;
+    fakeLeader.leader = false;
+    GtdCancelService<FakeLeaderCheck> gtdCancelService(config, fakeLeader);
+    gtdCancelService.start();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    int clientFd = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(clientFd, 0);
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(config.ouchListenPort);
+    inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
+    ASSERT_EQ(0, connect(clientFd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
+
+    const char orderToken[14] = "GTDNOTLEADER1";
+    const char symbol[8] = { 'T', 'E', 'S', 'T', ' ', ' ', ' ', ' ' };
+    auto frame = BuildOuchEnterOrderFrame(orderToken, 'B', 100, symbol, 40);
+    ASSERT_EQ(static_cast<ssize_t>(frame.size()),
+        send(clientFd, frame.data(), frame.size(), 0));
+    close(clientFd);
+
+    OrderEvent accepted{};
+    ASSERT_TRUE(WaitForPop(eventQ, accepted)) << "Order was never accepted";
+    ASSERT_EQ(OrderEventType::ACCEPTED, accepted.type);
+
+    gtdCancelService.schedule_cancel(orderToken,
+        std::chrono::system_clock::now() + std::chrono::milliseconds(50));
+
+    OrderEvent notCanceled{};
+    EXPECT_FALSE(WaitForPop(eventQ, notCanceled, std::chrono::milliseconds(300)))
+        << "a non-leader GtdCancelService must not send the cancel";
+
+    // Flip to leader and confirm the gate re-opens — this isn't a permanently
+    // closed switch, and a later leadership change should let the next due
+    // entry through normally.
+    fakeLeader.leader = true;
+    const char orderToken2[14] = "GTDNOWLEADER1";
+    auto frame2 = BuildOuchEnterOrderFrame(orderToken2, 'S', 25, symbol, 60);
+    int clientFd2 = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(clientFd2, 0);
+    ASSERT_EQ(0, connect(clientFd2, (sockaddr*)&serverAddr, sizeof(serverAddr)));
+    ASSERT_EQ(static_cast<ssize_t>(frame2.size()),
+        send(clientFd2, frame2.data(), frame2.size(), 0));
+    close(clientFd2);
+
+    OrderEvent accepted2{};
+    ASSERT_TRUE(WaitForPop(eventQ, accepted2)) << "Second order was never accepted";
+    ASSERT_EQ(OrderEventType::ACCEPTED, accepted2.type);
+
+    gtdCancelService.schedule_cancel(orderToken2,
+        std::chrono::system_clock::now() + std::chrono::milliseconds(50));
+
+    OrderEvent canceled{};
+    ASSERT_TRUE(WaitForPop(eventQ, canceled, std::chrono::milliseconds(500)))
+        << "GtdCancelService never fired once the gate reopened (leader=true)";
+    EXPECT_EQ(OrderEventType::CANCELED, canceled.type);
+    EXPECT_EQ(accepted2.order_id, canceled.order_id);
 
     gtdCancelService.stop();
     matchingService.stop();

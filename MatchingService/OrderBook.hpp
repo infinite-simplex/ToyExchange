@@ -396,6 +396,13 @@ public:
     {
     }
 
+    // Lets the scheduler be wired in after construction — needed when the
+    // real scheduler (GtdCancelService) itself depends on objects (a
+    // LeaderHeartbeatClient) that can only be built after this OrderBook,
+    // creating a construction-order cycle if the constructor were the only
+    // injection point. Must be called before any command reaches this book.
+    void set_gtd_scheduler(IGoodTillDayScheduler* scheduler) { m_gtd_scheduler = scheduler; }
+
 
     void submit_order(OuchOrderCommand& cmd) {
         // A well-formed wire frame with semantically invalid content (unknown
