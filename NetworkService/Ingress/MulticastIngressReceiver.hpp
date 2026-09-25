@@ -104,16 +104,19 @@ private:
     }
 
     // This is the "Ingress Server Thread" from OrderTrace's point of view for
-    // this process: stamps the ingress_tsc NetworkGateway captured at socket
-    // read (carried over the wire in the message), times the enqueue itself,
-    // and records the resulting queue depth — then pushes into the local
+    // this process: stamps the ingress_tai_ns NetworkGateway captured at
+    // socket read (carried over the wire in the message, as a synced
+    // wall-clock reading since it's read back on a different machine — see
+    // get_synced_time_ns() in Telemetry.hpp), times the enqueue itself with
+    // cheap local rdtsc (self-consistent, both reads on this machine), and
+    // records the resulting queue depth — then pushes into the local
     // Orderbook Input Disruptor (SPSC Queue). Used for both live traffic and
     // gap-filled records recovered via requestRetransmit, so recovered orders
     // get the same telemetry as ones that arrived live.
     // Returns false only if shutdown was requested mid-push (queue stayed full).
     bool pushWithTelemetry(const Message& msg) {
         OrderTrace& trace = g_telemetry_arena[trace_index(msg.command.trace_id)];
-        trace.ingress_tsc = msg.ingressTsc;
+        trace.ingress_tai_ns = msg.ingressTaiNs;
 
         uint64_t start = get_time();
         while (!m_inboundQueue.try_push(msg.command)) {

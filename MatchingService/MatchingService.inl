@@ -34,10 +34,10 @@ void MatchingService<TCommand>::poll() {
 		if (!popped) break; // shutting down while waiting for the next command
 
 		OrderTrace& trace = g_telemetry_arena[trace_index(cmd.trace_id)];
-		trace.engine_pop_tsc = get_time();
+		trace.engine_pop_tai_ns = get_synced_time_ns(); // compared against ingress_tai_ns, stamped on a different machine
 		//we have an inbound command, send to the orderbook
 		m_lob.submit_order(cmd);
-		trace.match_done_tsc = get_time();
+		trace.match_done_tai_ns = get_synced_time_ns();
 		m_lastAppliedSeq.store(cmd.trace_id, std::memory_order_relaxed);
 	}
 }

@@ -13,9 +13,12 @@
 #include "SPSCProducerPolicy.hpp"
 #include "IGoodTillDayScheduler.hpp"
 #include "MarketHours.hpp"
-#ifdef ENABLE_DETAILED_TELEMETRY
+// get_synced_time_ns() is needed unconditionally now (every OrderEvent's
+// .timestamp uses it, not just an ENABLE_DETAILED_TELEMETRY build) — was
+// previously guarded behind that flag here, though SPSCProducerPolicy.hpp
+// already pulls Telemetry.hpp in transitively either way; made explicit
+// and unconditional rather than relying on that transitive include.
 #include "Telemetry.hpp"
-#endif
 #define WORST_ASK 100
 #define WORST_BID 0
 
@@ -202,7 +205,7 @@ public:
         (*m_global_lookup)[order.get_id()] = &pooled_order;
         m_policy.on_order_event(OrderEvent{
             .type{OrderEventType::ACCEPTED},
-            .timestamp{Clock::now()},
+            .timestamp{get_synced_time_ns()},
             .sequence_number{m_next_sequence_number++},
             .order_id{order.get_id()},
             .firm_id{order.get_firm_id()},
@@ -250,7 +253,7 @@ public:
         m_free_pool[m_free_top++] = idx;
         m_policy.on_order_event(OrderEvent{
             .type{OrderEventType::CANCELED},
-            .timestamp{Clock::now()},
+            .timestamp{get_synced_time_ns()},
             .sequence_number{m_next_sequence_number++},
             .order_id{order_ptr->get_id()},
             .firm_id{order_ptr->get_firm_id()},
@@ -316,7 +319,7 @@ private:
                 //STP prevention, we cancel the aggressive order                
                 m_policy.on_order_event(OrderEvent{
                     .type{OrderEventType::REJECTED},
-                    .timestamp{Clock::now()},
+                    .timestamp{get_synced_time_ns()},
                     .sequence_number{m_next_sequence_number++},
                     .order_id{order.get_id()},
                     .firm_id{order.get_firm_id()},
@@ -369,7 +372,7 @@ private:
     inline OrderEvent create_trade_execution_event(Order& topOrder, Quantity matchedQuantity, Price p, ExecutionId matchId) {
         return OrderEvent{
             .type {OrderEventType::EXECUTED},
-            .timestamp {Clock::now()},
+            .timestamp {get_synced_time_ns()},
             .sequence_number{m_next_sequence_number++},
             .order_id{topOrder.get_id()},
             .firm_id{topOrder.get_firm_id()},
@@ -420,7 +423,7 @@ public:
         if (cmd.type != CommandType::CANCEL_ORDER && cmd.price > WORST_ASK) {
             m_telemetry_policy.on_order_event(OrderEvent{
                 .type{OrderEventType::REJECTED},
-                .timestamp{Clock::now()},
+                .timestamp{get_synced_time_ns()},
                 .sequence_number{m_next_sequence_number++},
                 .order_id{cmd.orderId},
                 .firm_id{0},
@@ -529,7 +532,7 @@ private:
         if (order.get_side() == SIDE::BID && m_ask_book.dry_run_available_quantity(order, order.get_initial_quantity()) < order.get_initial_quantity()) {
             m_telemetry_policy.on_order_event(OrderEvent{
                 .type{OrderEventType::REJECTED},
-                .timestamp{Clock::now()},
+                .timestamp{get_synced_time_ns()},
                 .sequence_number{m_next_sequence_number++},
                 .order_id{order.get_id()},
                 .firm_id{order.get_firm_id()},
@@ -546,7 +549,7 @@ private:
         else if (order.get_side() == SIDE::ASK && m_bid_book.dry_run_available_quantity(order, order.get_initial_quantity()) < order.get_initial_quantity()) {
             m_telemetry_policy.on_order_event(OrderEvent{
                 .type{OrderEventType::REJECTED},
-                .timestamp{Clock::now()},
+                .timestamp{get_synced_time_ns()},
                 .sequence_number{m_next_sequence_number++},
                 .order_id{order.get_id()},
                 .firm_id{order.get_firm_id()},
@@ -624,7 +627,7 @@ private:
         if (order.get_remaining_quantity() == 0u) return;
         m_telemetry_policy.on_order_event(OrderEvent{
             .type{OrderEventType::CANCELED},
-            .timestamp{Clock::now()},
+            .timestamp{get_synced_time_ns()},
             .sequence_number{m_next_sequence_number++},
             .order_id{order.get_id()},
             .firm_id{order.get_firm_id()},

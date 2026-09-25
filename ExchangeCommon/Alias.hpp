@@ -11,7 +11,17 @@ using FirmId = std::uint32_t;
 using PoolIdx = std::uint32_t;
 using Clock = std::chrono::steady_clock;
 using TraceId = std::uint32_t; // Wraps around every 4.2 billion orders
-using Timestamp = std::chrono::steady_clock::time_point;
+
+// Nanoseconds since the TAI epoch (see get_synced_time_ns() in
+// Telemetry.hpp). Deliberately not a std::chrono::steady_clock::time_point:
+// steady_clock's epoch is implementation-defined and arbitrary per machine
+// (typically boot time), so it has exactly the same cross-machine
+// incomparability problem as a raw TSC value — an OrderEvent stamped on one
+// machine and read/compared on another needs a real, synchronized wall-clock
+// reading. (std::chrono::tai_clock, the typed C++20 equivalent, is declared
+// but not implemented on this toolchain — confirmed via a direct compile
+// check against libstdc++ 11 — hence the plain integer instead.)
+using Timestamp = std::uint64_t;
 
 // Opaque per-connection correlation tag, minted once by NetworkGateway when a
 // client connects and stamped onto every command it sends. Carried through

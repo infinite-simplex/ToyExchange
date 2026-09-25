@@ -131,7 +131,7 @@ void NetworkGateway<TProtocolHandler, TCommand>::pollSockets() {
                 continue;
             }
 
-            uint64_t ingressTsc = get_time();
+            uint64_t ingressTaiNs = get_synced_time_ns(); // cross-machine-comparable — see Telemetry.hpp
             ssize_t bytesRead = recv(currentFd, m_readBuffer, BUFFER_SIZE, MSG_DONTWAIT);
 
             if (bytesRead <= 0) {
@@ -170,7 +170,7 @@ void NetworkGateway<TProtocolHandler, TCommand>::pollSockets() {
 
                 SequencedInboundMessage<TCommand> msg{};
                 msg.sequenceNumber = seq;
-                msg.ingressTsc = ingressTsc;
+                msg.ingressTaiNs = ingressTaiNs;
                 msg.clientSessionId = cmd.sessionId;
                 msg.command = cmd;
                 m_sequenceStore.append(msg); // append before multicast — closes the durability gap

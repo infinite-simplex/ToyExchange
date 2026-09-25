@@ -15,6 +15,7 @@
 #include <vector>
 #include <cstring>
 #include <chrono>
+#include <ctime>
 #include <thread>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -1160,7 +1161,7 @@ TEST(NetworkIngressPipelineTest, ReceiverRecoversGapViaRetransmitServer) {
 
     SequencedInboundMessage<OuchOrderCommand> msg0{};
     msg0.sequenceNumber = 0;
-    msg0.ingressTsc = 1;
+    msg0.ingressTaiNs = 1;
     msg0.clientSessionId = 1;
     msg0.command.trace_id = 500;
     msg0.command.type = CommandType::ENTER_ORDER;
@@ -1172,7 +1173,7 @@ TEST(NetworkIngressPipelineTest, ReceiverRecoversGapViaRetransmitServer) {
 
     SequencedInboundMessage<OuchOrderCommand> msg1{};
     msg1.sequenceNumber = 1;
-    msg1.ingressTsc = 2;
+    msg1.ingressTaiNs = 2;
     msg1.clientSessionId = 1;
     msg1.command.trace_id = 501;
     msg1.command.type = CommandType::ENTER_ORDER;
@@ -1280,17 +1281,17 @@ TEST(NetworkIngressPipelineTest, TelemetryIsCapturedConsistentlyAcrossStages) {
     ASSERT_TRUE(WaitForPop(eventQ, accepted)) << "Order was never accepted by the book";
 
     OrderTrace& trace = g_telemetry_arena[trace_index(0)];
-    // match_done_tsc is written just after submit_order() returns, which can
-    // land a hair after the ACCEPTED event popped above — give it a moment.
-    for (int i = 0; i < 200 && trace.match_done_tsc == 0; ++i) {
+    // match_done_tai_ns is written just after submit_order() returns, which
+    // can land a hair after the ACCEPTED event popped above — give it a moment.
+    for (int i = 0; i < 200 && trace.match_done_tai_ns == 0; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
-    EXPECT_NE(0u, trace.ingress_tsc) << "NetworkGateway's socket-read tsc never made it into the arena";
-    EXPECT_NE(0u, trace.engine_pop_tsc) << "MatchingService's queue-pop tsc never made it into the arena";
-    EXPECT_NE(0u, trace.match_done_tsc) << "MatchingService's post-submit tsc never made it into the arena";
-    EXPECT_GE(trace.match_done_tsc, trace.engine_pop_tsc)
-        << "match_done_tsc and engine_pop_tsc are both stamped from the same thread in sequence";
+    EXPECT_NE(0u, trace.ingress_tai_ns) << "NetworkGateway's socket-read timestamp never made it into the arena";
+    EXPECT_NE(0u, trace.engine_pop_tai_ns) << "MatchingService's queue-pop timestamp never made it into the arena";
+    EXPECT_NE(0u, trace.match_done_tai_ns) << "MatchingService's post-submit timestamp never made it into the arena";
+    EXPECT_GE(trace.match_done_tai_ns, trace.engine_pop_tai_ns)
+        << "match_done_tai_ns and engine_pop_tai_ns are both stamped from the same thread in sequence";
 
     matchingService.stop();
     receiver.stop();
@@ -1483,4 +1484,40 @@ TEST(ReplicaArbiterTest, LowestIdWinsAmongEligibleCandidatesOnFailover) {
     EXPECT_GT(afterFailover.epoch, initial.epoch);
 
     arbiter.stop();
+}
+
+// =====================================================================
+// get_synced_time_ns() — cross-machine-comparable telemetry timestamps
+// =====================================================================
+//
+// What's realistically testable here: that the primitive itself returns
+// real wall time (not an arbitrary local counter) and is monotonic across
+// rapid successive calls. Genuinely simulating two *unsynchronized*
+// machines isn't practical as a unit test without a mockable clock source
+// — that's a bigger change than this primitive needs, and out of scope.
+
+TEST(TelemetryTest, SyncedTimeMatchesRealWallClock) {
+    // time(nullptr) is seconds since the Unix epoch (UTC); CLOCK_TAI is
+    // currently 37 seconds ahead of UTC (the accumulated leap-second
+    // count) and drifts further only on the rare future leap second, so a
+    // wide tolerance comfortably covers both that fixed offset and any
+    // scheduling jitter between the two calls without the test needing to
+    // hardcode the current leap-second count.
+    uint64_t before = static_cast<uint64_t>(::time(nullptr)) * 1'000'000'000ull;
+    uint64_t synced = get_synced_time_ns();
+
+    constexpr uint64_t ONE_MINUTE_NS = 60ull * 1'000'000'000ull;
+    uint64_t diff = (synced > before) ? (synced - before) : (before - synced);
+    EXPECT_LT(diff, ONE_MINUTE_NS)
+        << "get_synced_time_ns() should be within real wall-clock range, not an arbitrary counter";
+}
+
+TEST(TelemetryTest, SyncedTimeIsMonotonicAcrossRapidCalls) {
+    uint64_t previous = get_synced_time_ns();
+    for (int i = 0; i < 1000; ++i) {
+        uint64_t current = get_synced_time_ns();
+        EXPECT_GE(current, previous)
+            << "get_synced_time_ns() went backward between two calls a moment apart";
+        previous = current;
+    }
 }

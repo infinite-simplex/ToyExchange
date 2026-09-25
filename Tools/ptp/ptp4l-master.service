@@ -1,0 +1,14 @@
+[Unit]
+Description=PTP master (software timestamping) for NetworkGateway host
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Replace <interface> with this host's actual NIC (e.g. eth0, ens5) before
+# installing — see README.md.
+ExecStart=/usr/sbin/ptp4l -f /etc/linuxptp/ptp4l-master.conf -i <interface> -S -m
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
