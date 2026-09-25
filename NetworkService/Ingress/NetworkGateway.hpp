@@ -31,7 +31,10 @@ struct ConnectionBuffer {
 
 // TProtocolHandler must provide:
 //   size_t validateAndParse(const char* buf, size_t availableLen, TCommand& outCmd);
-// returning bytes consumed (>0), or 0 if a full frame isn't available yet.
+// returning bytes consumed (>0), 0 if a full frame isn't available yet, or
+// TProtocolHandler::PARSE_FATAL_ERROR if a complete frame was received but
+// is structurally uninterpretable — NetworkGateway closes the connection in
+// that case rather than stalling on bytes that will never parse.
 template <typename TProtocolHandler, typename TCommand>
 class NetworkGateway {
 public:
@@ -69,6 +72,11 @@ public:
 
 private:
     void pollSockets();
+    // Full teardown for one connection: stop polling its fd, close it, and
+    // erase every piece of per-connection state. The single canonical place
+    // this happens — called both when recv() reports the peer is gone and
+    // when validateAndParse reports a structurally-broken frame.
+    void closeConnection(int fd);
 
     TProtocolHandler& m_protocolHandler;
     NetworkConfig       m_config;

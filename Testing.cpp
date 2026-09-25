@@ -713,6 +713,34 @@ TEST_F(GoodTillDayTest, GoodTillDayRestsAndSchedulesAutoCancelAtFourPmEst) {
     EXPECT_LE(scheduler.calls[0].cancelAt, after);
 }
 
+TEST_F(GoodTillDayTest, ReplaceOfGoodTillDayOrderReschedulesAutoCancelUnderNewToken) {
+    const char oldToken[14] = "GTD-OLDTOK001";
+    auto enter = make_enter_order_command(1, oldToken, 'B', 100, 50, ORDER_TYPE::GOOD_TILL_DAY);
+    LOB.submit_order(enter);
+    ASSERT_EQ(size_t(1), scheduler.calls.size()); // the original ENTER's own schedule
+
+    scheduler.calls.clear();
+    events.clear();
+
+    const char newToken[14] = "GTD-NEWTOK001";
+    auto replace = make_replace_order_command(1, 2, newToken, 75, 60);
+    auto before = today_4pm_est_utc();
+    LOB.submit_order(replace);
+    auto after = today_4pm_est_utc();
+
+    ASSERT_EQ(size_t(2), events.size());
+    EXPECT_EQ(OrderEventType::CANCELED, events[0].type);
+    EXPECT_EQ(OrderEventType::REPLACED, events[1].type);
+    EXPECT_EQ(Price(60), LOB.get_best_bid());
+
+    ASSERT_EQ(size_t(1), scheduler.calls.size())
+        << "the replacement is still GOOD_TILL_DAY and still resting — it needs its own fresh auto-cancel";
+    EXPECT_EQ(0, std::memcmp(newToken, scheduler.calls[0].orderToken, 14))
+        << "must schedule under the NEW token, not the one being replaced";
+    EXPECT_GE(scheduler.calls[0].cancelAt, before);
+    EXPECT_LE(scheduler.calls[0].cancelAt, after);
+}
+
 TEST_F(GoodTillDayTest, GoodTillDayThatFullyFillsOnEntryDoesNotScheduleAutoCancel) {
     // Resting leg entered directly as an Order with a real firm id, so it
     // doesn't self-trade-prevent against the GTD command below (which is
@@ -932,6 +960,35 @@ TEST_F(MatchingEngineTest, CancelOrderCommandWithUnknownTokenIsASafeNoOp) {
     EXPECT_TRUE(events.empty());
     EXPECT_EQ(size_t(1), traces.size())
         << "the cancel command's own trace still completes even when no target order was found";
+}
+
+// =====================================================================
+// CommandType::INVALID — OuchProtocolHandler already decided a well-formed
+// frame's content can't become a real order (unknown symbol, unrecognized
+// order-type byte); OrderBook just rejects it through the normal pipeline
+// without ever touching the book. See OuchProtocolHandler.cpp's error
+// policy and NetworkIngressPipelineTest's wire-level coverage of this.
+// =====================================================================
+
+TEST_F(MatchingEngineTest, InvalidCommandIsRejectedWithoutTouchingTheBook) {
+    OuchOrderCommand cmd{};
+    cmd.trace_id = 1;
+    cmd.type = CommandType::INVALID;
+    cmd.invalidReason = RejectReason::UNKNOWN_SYMBOL;
+    cmd.buySellIndicator = 'B';
+    cmd.price = 40;
+    cmd.shares = 50;
+
+    LOB.submit_order(cmd);
+
+    ASSERT_EQ(size_t(1), events.size());
+    EXPECT_EQ(OrderEventType::REJECTED, events[0].type);
+    EXPECT_EQ(RejectReason::UNKNOWN_SYMBOL, events[0].reject_reason);
+    EXPECT_EQ(SIDE::BID, events[0].side);
+    EXPECT_EQ(Price(40), events[0].price);
+    EXPECT_EQ(Quantity(50), events[0].quantity);
+    EXPECT_EQ(Price(INVALID_PRICE), LOB.get_best_bid()) << "an INVALID command must never touch the book";
+    EXPECT_EQ(size_t(1), traces.size());
 }
 
 // =====================================================================
@@ -1351,6 +1408,196 @@ TEST(NetworkIngressPipelineTest, GatewayToReceiverDeliversParsedOrderOverLoopbac
     EXPECT_EQ(FirmId(7), received.firmId);
     EXPECT_EQ(0, std::memcmp(orderToken, received.orderToken, 14));
 
+    receiver.stop();
+    gateway.stop();
+}
+
+// Sends `frame` on a fresh connection and returns whether the server closed
+// it: sets a short receive timeout, then recv()s — 0 bytes means the peer
+// (the gateway) closed the connection; a timeout means it's still open.
+bool SendFrameAndCheckConnectionClosed(uint16_t port, const std::vector<char>& frame) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(port);
+    inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
+    if (connect(fd, (sockaddr*)&serverAddr, sizeof(serverAddr)) != 0) {
+        close(fd);
+        return false;
+    }
+    send(fd, frame.data(), frame.size(), 0);
+
+    timeval timeout{};
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 500'000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    char buf[16];
+    ssize_t n = recv(fd, buf, sizeof(buf), 0);
+    close(fd);
+    return n == 0; // EOF — the gateway closed its end
+}
+
+TEST(NetworkIngressPipelineTest, BadBodyLengthClosesTheConnection) {
+    SymbolRegistry registry;
+    registry.registerSymbol("TEST");
+    OrderTokenRegistry orderTokenRegistry;
+    OuchProtocolHandler handler(registry, orderTokenRegistry);
+
+    NetworkConfig config;
+    config.ouchListenPort = 15109;
+    config.multicastIp = "239.255.0.10";
+    config.multicastPort = 25110;
+
+    NetworkGateway<OuchProtocolHandler, OuchOrderCommand> gateway(
+        handler, config, "/tmp/eceo_test_seq_store_badbody.dat", 1024);
+    gateway.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // ENTER_ORDER ('O') needs a 36-byte body; send only 10 garbage bytes.
+    constexpr uint16_t payloadLen = 1 + 10;
+    std::vector<char> frame(2 + payloadLen, '\0');
+    frame[0] = static_cast<char>((payloadLen >> 8) & 0xFF);
+    frame[1] = static_cast<char>(payloadLen & 0xFF);
+    frame[2] = 'O';
+
+    EXPECT_TRUE(SendFrameAndCheckConnectionClosed(config.ouchListenPort, frame))
+        << "a frame with a body length that can't possibly be a valid ENTER_ORDER should disconnect, not stall";
+
+    gateway.stop();
+}
+
+TEST(NetworkIngressPipelineTest, UnrecognizedMessageTypeClosesTheConnection) {
+    SymbolRegistry registry;
+    registry.registerSymbol("TEST");
+    OrderTokenRegistry orderTokenRegistry;
+    OuchProtocolHandler handler(registry, orderTokenRegistry);
+
+    NetworkConfig config;
+    config.ouchListenPort = 15110;
+    config.multicastIp = "239.255.0.11";
+    config.multicastPort = 25111;
+
+    NetworkGateway<OuchProtocolHandler, OuchOrderCommand> gateway(
+        handler, config, "/tmp/eceo_test_seq_store_badtype.dat", 1024);
+    gateway.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    constexpr uint16_t payloadLen = 1 + 4;
+    std::vector<char> frame(2 + payloadLen, '\0');
+    frame[0] = static_cast<char>((payloadLen >> 8) & 0xFF);
+    frame[1] = static_cast<char>(payloadLen & 0xFF);
+    frame[2] = 'Z'; // not 'O'/'X'/'U'
+
+    EXPECT_TRUE(SendFrameAndCheckConnectionClosed(config.ouchListenPort, frame))
+        << "an unrecognized message type byte should disconnect, not stall";
+
+    gateway.stop();
+}
+
+TEST(NetworkIngressPipelineTest, UnknownOrderTypeByteIsRejectedNotDisconnected) {
+    SymbolRegistry registry;
+    registry.registerSymbol("TEST");
+    OrderTokenRegistry orderTokenRegistry;
+    OuchProtocolHandler handler(registry, orderTokenRegistry);
+
+    NetworkConfig config;
+    config.ouchListenPort = 15111;
+    config.multicastIp = "239.255.0.12";
+    config.multicastPort = 25112;
+
+    NetworkGateway<OuchProtocolHandler, OuchOrderCommand> gateway(
+        handler, config, "/tmp/eceo_test_seq_store_badordertype.dat", 1024);
+    gateway.start();
+
+    SPSCQueue<OuchOrderCommand> inboundQueue;
+    MulticastIngressReceiver<OuchOrderCommand> receiver(inboundQueue, config);
+    receiver.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    int clientFd = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(clientFd, 0);
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(config.ouchListenPort);
+    inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
+    ASSERT_EQ(0, connect(clientFd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
+
+    const char orderToken[14] = "BADORDERTYPE1";
+    const char symbol[8] = { 'T', 'E', 'S', 'T', ' ', ' ', ' ', ' ' };
+    // ORDER_TYPE's highest valid value is MARKET (7) — 99 is well outside it.
+    auto badFrame = BuildOuchEnterOrderFrame(orderToken, 'B', 50, symbol, 40, static_cast<ORDER_TYPE>(99));
+    ASSERT_EQ(static_cast<ssize_t>(badFrame.size()), send(clientFd, badFrame.data(), badFrame.size(), 0));
+
+    OuchOrderCommand invalid{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, invalid)) << "the malformed-content frame never arrived";
+    EXPECT_EQ(CommandType::INVALID, invalid.type);
+    EXPECT_EQ(RejectReason::INVALID_ORDER_TYPE, invalid.invalidReason);
+
+    // Connection must still be open — a second, valid frame should still work.
+    const char orderToken2[14] = "VALIDAFTERBAD";
+    auto goodFrame = BuildOuchEnterOrderFrame(orderToken2, 'S', 25, symbol, 60);
+    ASSERT_EQ(static_cast<ssize_t>(goodFrame.size()), send(clientFd, goodFrame.data(), goodFrame.size(), 0));
+
+    OuchOrderCommand valid{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, valid)) << "connection was closed when it shouldn't have been";
+    EXPECT_EQ(CommandType::ENTER_ORDER, valid.type);
+    EXPECT_EQ(0, std::memcmp(orderToken2, valid.orderToken, 14));
+
+    close(clientFd);
+    receiver.stop();
+    gateway.stop();
+}
+
+TEST(NetworkIngressPipelineTest, UnknownSymbolIsRejectedNotDisconnected) {
+    SymbolRegistry registry;
+    registry.registerSymbol("TEST"); // deliberately not registering "NOPE"
+    OrderTokenRegistry orderTokenRegistry;
+    OuchProtocolHandler handler(registry, orderTokenRegistry);
+
+    NetworkConfig config;
+    config.ouchListenPort = 15112;
+    config.multicastIp = "239.255.0.13";
+    config.multicastPort = 25113;
+
+    NetworkGateway<OuchProtocolHandler, OuchOrderCommand> gateway(
+        handler, config, "/tmp/eceo_test_seq_store_badsymbol.dat", 1024);
+    gateway.start();
+
+    SPSCQueue<OuchOrderCommand> inboundQueue;
+    MulticastIngressReceiver<OuchOrderCommand> receiver(inboundQueue, config);
+    receiver.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    int clientFd = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(clientFd, 0);
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(config.ouchListenPort);
+    inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
+    ASSERT_EQ(0, connect(clientFd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
+
+    const char orderToken[14] = "BADSYMBOLTOK1";
+    const char badSymbol[8] = { 'N', 'O', 'P', 'E', ' ', ' ', ' ', ' ' };
+    auto badFrame = BuildOuchEnterOrderFrame(orderToken, 'B', 50, badSymbol, 40);
+    ASSERT_EQ(static_cast<ssize_t>(badFrame.size()), send(clientFd, badFrame.data(), badFrame.size(), 0));
+
+    OuchOrderCommand invalid{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, invalid)) << "the malformed-content frame never arrived";
+    EXPECT_EQ(CommandType::INVALID, invalid.type);
+    EXPECT_EQ(RejectReason::UNKNOWN_SYMBOL, invalid.invalidReason);
+
+    const char orderToken2[14] = "VALIDAFTERBD2";
+    const char goodSymbol[8] = { 'T', 'E', 'S', 'T', ' ', ' ', ' ', ' ' };
+    auto goodFrame = BuildOuchEnterOrderFrame(orderToken2, 'S', 25, goodSymbol, 60);
+    ASSERT_EQ(static_cast<ssize_t>(goodFrame.size()), send(clientFd, goodFrame.data(), goodFrame.size(), 0));
+
+    OuchOrderCommand valid{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, valid)) << "connection was closed when it shouldn't have been";
+    EXPECT_EQ(CommandType::ENTER_ORDER, valid.type);
+
+    close(clientFd);
     receiver.stop();
     gateway.stop();
 }
@@ -2188,4 +2435,126 @@ TEST(PerformanceServiceWireTest, ForwarderReachesReceiverAndAggregator) {
         .metrics[metric_index(MetricKind::EngineExecutionNs)].mostRecentlyClosed();
     EXPECT_EQ(1, engine->total_count);
     EXPECT_EQ(250, hdr_min(engine));
+}
+
+// =====================================================================
+// Telemetry arena wraparound detection — g_telemetry_arena_collisions is a
+// single process-wide global (like g_telemetry_arena itself), so these
+// assert on the DELTA a specific action causes rather than an absolute
+// value, immune to whatever earlier tests in this binary already did.
+// =====================================================================
+
+TEST(TelemetryWraparoundTest, DetectsCollisionWhenSlotNeverReleased) {
+    NetworkConfig config;
+    config.multicastIp = "239.255.0.14";
+    config.multicastPort = 25114;
+
+    SPSCQueue<OuchOrderCommand> inboundQueue;
+    MulticastIngressReceiver<OuchOrderCommand> receiver(inboundQueue, config);
+    receiver.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    int senderFd = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(senderFd, 0);
+    sockaddr_in destAddr{};
+    destAddr.sin_family = AF_INET;
+    destAddr.sin_port = htons(config.multicastPort);
+    inet_pton(AF_INET, config.multicastIp.c_str(), &destAddr.sin_addr);
+
+    // Large, distinctive trace_ids unlikely to collide with anything any
+    // other test in this binary uses (most use small ids like 1-10) — differ
+    // by exactly TELEMETRY_POOL_SIZE, so trace_index() maps both to the same
+    // slot. sequenceNumber is unrelated and must stay small/sequential —
+    // MulticastIngressReceiver treats a jump in IT (not trace_id) as a gap.
+    constexpr TraceId firstTrace = 500'000;
+    constexpr TraceId secondTrace = firstTrace + static_cast<TraceId>(TELEMETRY_POOL_SIZE);
+
+    auto sendMsg = [&](uint64_t seq, TraceId traceId, const char token[14]) {
+        SequencedInboundMessage<OuchOrderCommand> msg{};
+        msg.sequenceNumber = seq;
+        msg.ingressTaiNs = 1;
+        msg.clientSessionId = 1;
+        msg.command.trace_id = traceId;
+        msg.command.type = CommandType::ENTER_ORDER;
+        std::memcpy(msg.command.orderToken, token, 14);
+        ASSERT_EQ(static_cast<ssize_t>(sizeof(msg)),
+            sendto(senderFd, &msg, sizeof(msg), 0, (sockaddr*)&destAddr, sizeof(destAddr)));
+    };
+
+    sendMsg(0, firstTrace, "WRAP-FIRST0001");
+    OuchOrderCommand received1{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, received1)) << "first message never arrived";
+
+    uint64_t afterFirst = g_telemetry_arena_collisions.load(std::memory_order_relaxed);
+
+    // Second claim of the SAME slot, different trace_id, with no
+    // complete_trace() ever called for firstTrace in between — a genuine
+    // collision: firstTrace's telemetry is about to be silently stomped.
+    sendMsg(1, secondTrace, "WRAP-SECOND001");
+    OuchOrderCommand received2{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, received2)) << "second message never arrived";
+
+    uint64_t afterSecond = g_telemetry_arena_collisions.load(std::memory_order_relaxed);
+    EXPECT_EQ(afterFirst + 1, afterSecond)
+        << "reclaiming a still-owned slot without an intervening complete_trace() must count as a collision";
+
+    close(senderFd);
+    receiver.stop();
+}
+
+TEST(TelemetryWraparoundTest, NoCollisionWhenSlotWasProperlyReleased) {
+    NetworkConfig config;
+    config.multicastIp = "239.255.0.15";
+    config.multicastPort = 25115;
+
+    SPSCQueue<OuchOrderCommand> inboundQueue;
+    MulticastIngressReceiver<OuchOrderCommand> receiver(inboundQueue, config);
+    receiver.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    int senderFd = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(senderFd, 0);
+    sockaddr_in destAddr{};
+    destAddr.sin_family = AF_INET;
+    destAddr.sin_port = htons(config.multicastPort);
+    inet_pton(AF_INET, config.multicastIp.c_str(), &destAddr.sin_addr);
+
+    constexpr TraceId firstTrace = 600'000;
+    constexpr TraceId secondTrace = firstTrace + static_cast<TraceId>(TELEMETRY_POOL_SIZE);
+
+    auto sendMsg = [&](uint64_t seq, TraceId traceId, const char token[14]) {
+        SequencedInboundMessage<OuchOrderCommand> msg{};
+        msg.sequenceNumber = seq;
+        msg.ingressTaiNs = 1;
+        msg.clientSessionId = 1;
+        msg.command.trace_id = traceId;
+        msg.command.type = CommandType::ENTER_ORDER;
+        std::memcpy(msg.command.orderToken, token, 14);
+        ASSERT_EQ(static_cast<ssize_t>(sizeof(msg)),
+            sendto(senderFd, &msg, sizeof(msg), 0, (sockaddr*)&destAddr, sizeof(destAddr)));
+    };
+
+    sendMsg(0, firstTrace, "RLSD-FIRST0001");
+    OuchOrderCommand received1{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, received1)) << "first message never arrived";
+
+    // Properly release the slot, same as OrderBook does on real trace
+    // completion, before the second claim arrives.
+    std::vector<OrderEvent> events;
+    std::vector<OrderTrace> traces;
+    TestingPolicy policy{ events, traces };
+    complete_trace(policy, firstTrace);
+
+    uint64_t afterRelease = g_telemetry_arena_collisions.load(std::memory_order_relaxed);
+
+    sendMsg(1, secondTrace, "RLSD-SECOND001");
+    OuchOrderCommand received2{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, received2)) << "second message never arrived";
+
+    uint64_t afterSecond = g_telemetry_arena_collisions.load(std::memory_order_relaxed);
+    EXPECT_EQ(afterRelease, afterSecond)
+        << "a properly-released slot must not register as a collision when legitimately reclaimed";
+
+    close(senderFd);
+    receiver.stop();
 }

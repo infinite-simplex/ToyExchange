@@ -136,15 +136,7 @@ void NetworkGateway<TProtocolHandler, TCommand>::pollSockets() {
 
             if (bytesRead <= 0) {
                 if (bytesRead < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
-                epoll_ctl(m_epollFd, EPOLL_CTL_DEL, currentFd, nullptr);
-                close(currentFd);
-                m_connBuffers.erase(currentFd);
-                auto sessionIt = m_fdToSession.find(currentFd);
-                if (sessionIt != m_fdToSession.end()) {
-                    std::lock_guard<std::mutex> lock(m_sessionMutex);
-                    m_sessionToFd.erase(sessionIt->second);
-                    m_fdToSession.erase(sessionIt);
-                }
+                closeConnection(currentFd);
                 continue;
             }
 
@@ -155,6 +147,10 @@ void NetworkGateway<TProtocolHandler, TCommand>::pollSockets() {
                 TCommand cmd{};
                 size_t consumed = m_protocolHandler.validateAndParse(
                     connBuf.m_data.data(), connBuf.m_validBytes, cmd);
+                if (consumed == TProtocolHandler::PARSE_FATAL_ERROR) {
+                    closeConnection(currentFd); // connBuf now dangles (erased below) — don't touch it after this
+                    break;
+                }
                 if (consumed == 0) break;
 
                 const uint64_t seq = m_sequenceNumber++;
@@ -180,5 +176,18 @@ void NetworkGateway<TProtocolHandler, TCommand>::pollSockets() {
                 connBuf.consume(consumed);
             }
         }
+    }
+}
+
+template <typename TProtocolHandler, typename TCommand>
+void NetworkGateway<TProtocolHandler, TCommand>::closeConnection(int fd) {
+    epoll_ctl(m_epollFd, EPOLL_CTL_DEL, fd, nullptr);
+    close(fd);
+    m_connBuffers.erase(fd);
+    auto sessionIt = m_fdToSession.find(fd);
+    if (sessionIt != m_fdToSession.end()) {
+        std::lock_guard<std::mutex> lock(m_sessionMutex);
+        m_sessionToFd.erase(sessionIt->second);
+        m_fdToSession.erase(sessionIt);
     }
 }

@@ -25,11 +25,19 @@ namespace {
 //   [1 byte]      msgType     -- 'O' = Enter, 'X' = Cancel, 'U' = Replace
 //   [payloadLen-1 bytes]      -- type-specific body, see each case below
 //
-// NOTE on error policy: a malformed frame (bad length, unknown type, unknown
-// symbol) currently returns 0, which stalls that connection's buffer rather
-// than disconnecting it or skipping the bad frame. This is a placeholder —
-// decide on a real policy (disconnect / reject message / skip-and-resync)
-// before this touches real traffic. See flagged spots below.
+// Error policy, split by whether a command can even be built from the bytes:
+//   - Structurally uninterpretable (bad body length for the given type, an
+//     unrecognized message type byte): the wire framing itself is broken,
+//     nothing downstream could make sense of it either. Returns
+//     PARSE_FATAL_ERROR; NetworkGateway closes the connection rather than
+//     stalling on bytes that will never parse.
+//   - Well-formed frame, invalid content (unknown order-type byte, unknown
+//     symbol): the frame has the right shape, a real OuchOrderCommand can
+//     still be built from what's already parsed. Returns totalFrameLen with
+//     type = CommandType::INVALID, same as any other command — OrderBook
+//     rejects it through the normal pipeline, matching how CANCEL_ORDER's
+//     unknown-token case below is already "accepted, not rejected" at this
+//     layer rather than killing the session over a business-level miss.
 // ---------------------------------------------------------------------------
 
 size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLen, OuchOrderCommand& outCmd) {
@@ -48,7 +56,7 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
         return 0; // full frame hasn't arrived yet
     }
     if (payloadLen < TYPE_FIELD_SIZE) {
-        return 0; // FLAG: malformed frame — see NOTE above on error policy
+        return PARSE_FATAL_ERROR; // no type byte at all — can't tell what this even is
     }
 
     char msgType = buf[LENGTH_FIELD_SIZE];
@@ -59,7 +67,7 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
     case 'O': { // ENTER_ORDER
         constexpr size_t EXPECTED_BODY_LEN = 14 + 1 + 1 + 4 + 8 + 4 + 4;
         if (bodyLen != EXPECTED_BODY_LEN) {
-            return 0; // FLAG: malformed — see NOTE above
+            return PARSE_FATAL_ERROR; // body doesn't even have the right shape to extract fields from
         }
 
         size_t off = 0;
@@ -74,7 +82,14 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
         uint8_t orderTypeByte = static_cast<uint8_t>(body[off]);
         off += 1;
         if (orderTypeByte > MAX_VALID_ORDER_TYPE) {
-            return 0; // FLAG: unknown order type — see NOTE above on error policy
+            // Well-formed frame, invalid content — reject downstream rather
+            // than disconnect (see error-policy note above). Bail out here
+            // rather than parsing further: orderId is never minted and the
+            // token is never registered, same as replace_order's own
+            // UNKNOWN_ORDER reject when no real order exists.
+            outCmd.type = CommandType::INVALID;
+            outCmd.invalidReason = RejectReason::INVALID_ORDER_TYPE;
+            return totalFrameLen;
         }
         outCmd.orderType = static_cast<ORDER_TYPE>(orderTypeByte);
 
@@ -86,7 +101,9 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
 
         uint16_t stockLocate = m_symbolRegistry.lookup(symbol);
         if (stockLocate == SymbolRegistry::INVALID_SLOT) {
-            return 0; // FLAG: unknown symbol — see NOTE above on error policy
+            outCmd.type = CommandType::INVALID;
+            outCmd.invalidReason = RejectReason::UNKNOWN_SYMBOL;
+            return totalFrameLen;
         }
         outCmd.stockLocate = stockLocate; // widens uint16_t -> uint32_t, fine
 
@@ -106,7 +123,7 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
     case 'X': { // CANCEL_ORDER
         constexpr size_t EXPECTED_BODY_LEN = 14 + 4;
         if (bodyLen != EXPECTED_BODY_LEN) {
-            return 0; // FLAG: malformed — see NOTE above
+            return PARSE_FATAL_ERROR; // body doesn't even have the right shape to extract fields from
         }
 
         size_t off = 0;
@@ -137,7 +154,7 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
         // since a token is meant to identify one specific order instance.
         constexpr size_t EXPECTED_BODY_LEN = 14 + 14 + 4 + 4;
         if (bodyLen != EXPECTED_BODY_LEN) {
-            return 0; // FLAG: malformed — see NOTE above
+            return PARSE_FATAL_ERROR; // body doesn't even have the right shape to extract fields from
         }
 
         size_t off = 0;
@@ -176,6 +193,6 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
     }
 
     default:
-        return 0; // FLAG: unknown type byte — see NOTE above
+        return PARSE_FATAL_ERROR; // no idea how to interpret the body at all
     }
 }

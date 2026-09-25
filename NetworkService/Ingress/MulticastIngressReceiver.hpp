@@ -134,6 +134,18 @@ private:
     // Returns false only if shutdown was requested mid-push (queue stayed full).
     bool pushWithTelemetry(const Message& msg) {
         OrderTrace& trace = g_telemetry_arena[trace_index(msg.command.trace_id)];
+
+        // This is the sole slot-claim site: if the slot's previous occupant
+        // never got a chance to release it (complete_trace() below) before
+        // wrapping all the way back around to us, that's a genuine
+        // wraparound collision — most likely a long-resting GTC order whose
+        // telemetry is about to be silently overwritten. Not preventable
+        // without unbounded memory; at least make it observable.
+        if (trace.owner_trace_id != INVALID_TRACE_ID && trace.owner_trace_id != msg.command.trace_id) {
+            g_telemetry_arena_collisions.fetch_add(1, std::memory_order_relaxed);
+        }
+        trace.owner_trace_id = msg.command.trace_id;
+
         trace.ingress_tai_ns = msg.ingressTaiNs;
         trace.replica_ingress_tai_ns = get_synced_time_ns();
 

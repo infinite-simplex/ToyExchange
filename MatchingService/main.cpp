@@ -8,6 +8,7 @@
 #include "OrderBook.hpp"
 #include "SPSCProducerPolicy.hpp"
 #include "SPSCQueue.hpp"
+#include "Telemetry.hpp"
 #include "TelemetryForwarder.hpp"
 
 #include <atomic>
@@ -113,7 +114,9 @@ int main(int argc, char** argv) {
             std::cout << "[" << replicaId << "] best bid=" << static_cast<int>(book.get_best_bid())
                       << " best ask=" << static_cast<int>(book.get_best_ask())
                       << " leader=" << (heartbeatClient.isLeader() ? "yes" : "no")
-                      << " epoch=" << heartbeatClient.currentEpoch() << "\n";
+                      << " epoch=" << heartbeatClient.currentEpoch()
+                      << " telemetry_collisions=" << g_telemetry_arena_collisions.load(std::memory_order_relaxed)
+                      << "\n";
         }
     } else {
         while (!g_shutdownRequested.load(std::memory_order_relaxed) && !receiver.hitUnrecoverableGap()) {
@@ -126,10 +129,18 @@ int main(int argc, char** argv) {
                   << "this replica's book can no longer be trusted.\n";
     }
     std::cout << "MatchingService[" << replicaId << "] shutting down...\n";
+    // matcher stops first, deliberately: SPSCProducerPolicy::on_order_event
+    // spins forever on a full eventQueue with no shutdown-flag check (order
+    // events must never drop, unlike traces). Stopping egressPublisher
+    // before matcher would risk matcher's own worker thread being stuck
+    // inside that spin with nothing left to drain the queue, hanging
+    // matcher.stop()'s join. Stopping matcher first guarantees
+    // egressPublisher is still alive to drain anything matcher's thread is
+    // mid-push on, so it always finishes and matcher.stop() always returns.
+    matcher.stop();
     telemetryForwarder.stop();
     egressPublisher.stop();
     heartbeatClient.stop();
-    matcher.stop();
     receiver.stop();
     return receiver.hitUnrecoverableGap() ? 2 : 0;
 }

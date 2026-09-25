@@ -1,12 +1,18 @@
 #pragma once
 #include <cstdint>
 #include "Alias.hpp"
+#include "OrderEvent.hpp"
 #include "OrderTypes.hpp"
 
 enum class CommandType : uint8_t {
     ENTER_ORDER,
     CANCEL_ORDER,
-    REPLACE_ORDER
+    REPLACE_ORDER,
+    INVALID // wire frame was syntactically well-formed but semantically
+            // invalid (unknown symbol, unrecognized order-type byte) — see
+            // OuchProtocolHandler.cpp. Carries just enough (invalidReason)
+            // for OrderBook::submit_order to reject it through the normal
+            // pipeline, same as any other REJECTED order.
 };
 
 
@@ -30,6 +36,7 @@ struct OuchOrderCommand {
                                      // (for REPLACE_ORDER, this is the new token, not the one being
                                      // replaced). CANCEL_ORDER: token of the order being canceled.
     char        buySellIndicator;   // 'B' or 'S'
-    CommandType type;               // wire message kind: Enter/Cancel/Replace
+    CommandType type;               // wire message kind: Enter/Cancel/Replace/Invalid
     ORDER_TYPE  orderType{ ORDER_TYPE::LIMIT }; // matching behavior, meaningful only when type == ENTER_ORDER
+    RejectReason invalidReason{ RejectReason::NONE }; // meaningful only when type == CommandType::INVALID
 };

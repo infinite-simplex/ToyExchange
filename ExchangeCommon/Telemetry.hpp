@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <cstddef>
 #include <chrono>
@@ -21,6 +22,10 @@ struct alignas(64) OrderTrace {
                                                 // apart from queuing delay
                                                 // (engine_pop_tai_ns - replica_ingress_tai_ns).
     std::uint32_t inbound_q_depth{ 0 };        // SPSC depth at push time
+    TraceId owner_trace_id{ INVALID_TRACE_ID }; // which trace currently owns this slot — lets
+                                                // pushWithTelemetry() tell a genuine wraparound
+                                                // collision apart from ordinary slot reuse; cleared
+                                                // back to INVALID_TRACE_ID by complete_trace() below.
     std::uint64_t inbound_q_submitted{ 0 };    // time taken to add to the queue — purely local
                                                 // (both reads happen on the same machine), so this
                                                 // one stays on raw get_time() cycles; only fields
@@ -71,10 +76,32 @@ static_assert((TELEMETRY_POOL_SIZE & (TELEMETRY_POOL_SIZE - 1)) == 0,
     "TELEMETRY_POOL_SIZE must be a power of 2 for trace_index()'s masking");
 alignas(64) inline OrderTrace g_telemetry_arena[TELEMETRY_POOL_SIZE];
 
+// Counts genuine wraparound collisions (a slot reclaimed by a new trace
+// before the previous occupant's own complete_trace() ever ran) — see
+// MulticastIngressReceiver::pushWithTelemetry, the sole slot-claim site.
+// Cross-thread (claimed on the ingress receiver's thread, typically read
+// from main()'s stats loop), hence atomic.
+inline std::atomic<std::uint64_t> g_telemetry_arena_collisions{ 0 };
+
 // The single canonical way to turn a TraceId into an arena slot. Every
 // read/write of g_telemetry_arena must go through this — never index it
 // directly with a raw id, or two call sites can silently disagree on which
 // slot belongs to a given order (or index out of bounds entirely).
 inline std::size_t trace_index(TraceId id) noexcept {
     return static_cast<std::size_t>(id) & (TELEMETRY_POOL_SIZE - 1);
+}
+
+// The single canonical way to complete a trace: reports it to the policy
+// (production forwards it toward PerformanceService; tests just record it),
+// then releases the arena slot by clearing owner_trace_id — without this,
+// every later slot reuse would look like a collision, making
+// g_telemetry_arena_collisions meaningless. Not noexcept: TestingPolicy's
+// on_trace_complete isn't either (it can throw from std::vector::push_back),
+// and wrapping it here would turn that into a std::terminate instead of a
+// propagated exception.
+template <typename TelemetryPolicy>
+inline void complete_trace(TelemetryPolicy& policy, TraceId id) {
+    OrderTrace& trace = g_telemetry_arena[trace_index(id)];
+    policy.on_trace_complete(trace);
+    trace.owner_trace_id = INVALID_TRACE_ID;
 }

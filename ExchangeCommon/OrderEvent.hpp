@@ -18,6 +18,8 @@ enum class RejectReason : uint8_t {
     SELF_TRADING_PREVENTION,
     INSUFFICIENT_LIQUIDITY,
     PRICE_OUT_OF_RANGE,   // price outside [WORST_BID, WORST_ASK]
+    UNKNOWN_SYMBOL,       // ENTER_ORDER named a symbol SymbolRegistry never registered
+    INVALID_ORDER_TYPE,   // ENTER_ORDER's order-type byte is outside the recognized range
 };
 
 struct OrderEvent {

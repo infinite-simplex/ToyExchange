@@ -11,6 +11,9 @@ using FirmId = std::uint32_t;
 using PoolIdx = std::uint32_t;
 using Clock = std::chrono::steady_clock;
 using TraceId = std::uint32_t; // Wraps around every 4.2 billion orders
+constexpr TraceId INVALID_TRACE_ID = 0xFFFFFFFFu; // trace_id 0 is a real, assigned value
+                                                   // (the very first command), so unlike
+                                                   // OrderId/SessionId this can't reuse 0
 
 // Nanoseconds since the TAI epoch (see get_synced_time_ns() in
 // Telemetry.hpp). Deliberately not a std::chrono::steady_clock::time_point:

@@ -248,7 +248,7 @@ public:
         if (priceLevel.get_resting_quantity() == 0) {
             m_active_prices_mask.reset(p);
         }
-        m_policy.on_trace_complete(g_telemetry_arena[trace_index(order_ptr->m_telemetry_idx)]);
+        complete_trace(m_policy, order_ptr->m_telemetry_idx);
         (*m_global_lookup)[order_id] = nullptr;
         m_free_pool[m_free_top++] = idx;
         m_policy.on_order_event(OrderEvent{
@@ -351,7 +351,7 @@ private:
                 else {
                     priceLevel.m_tail = INVALID_IDX;
                 }
-                m_policy.on_trace_complete(g_telemetry_arena[trace_index(topOrder.m_telemetry_idx)]);
+                complete_trace(m_policy, topOrder.m_telemetry_idx);
                 (*m_global_lookup)[topOrder.get_id()] = nullptr;
                 m_free_pool[m_free_top++] = curr;
 
@@ -412,6 +412,30 @@ public:
 
 
     void submit_order(OuchOrderCommand& cmd) {
+        // A well-formed wire frame with semantically invalid content (unknown
+        // symbol, unrecognized order-type byte) — OuchProtocolHandler already
+        // decided this can't become a real order; just reject it through the
+        // normal pipeline, same shape as any other REJECTED command, and
+        // never touch the book. See OuchProtocolHandler.cpp's error-policy note.
+        if (cmd.type == CommandType::INVALID) {
+            m_telemetry_policy.on_order_event(OrderEvent{
+                .type{OrderEventType::REJECTED},
+                .timestamp{get_synced_time_ns()},
+                .sequence_number{m_next_sequence_number++},
+                .order_id{cmd.orderId},
+                .firm_id{0},
+                .session_id{cmd.sessionId},
+                .side{cmd.buySellIndicator == 'B' ? SIDE::BID : SIDE::ASK},
+                .price{cmd.price},
+                .quantity{cmd.shares},
+                .leaves_quantity{0},
+                .match_id{0},
+                .reject_reason{cmd.invalidReason}
+                });
+            complete_trace(m_telemetry_policy, cmd.trace_id);
+            return;
+        }
+
         // REPLACE_ORDER needs fundamentally different handling than "build
         // an Order and dispatch on its type" — it must look up the existing
         // order to inherit side/firm/type, so it gets its own path entirely.
@@ -441,7 +465,7 @@ public:
                 });
             // No Order was ever constructed for this reject, so nothing else
             // will ever complete this trace_id — do it here directly.
-            m_telemetry_policy.on_trace_complete(g_telemetry_arena[trace_index(cmd.trace_id)]);
+            complete_trace(m_telemetry_policy, cmd.trace_id);
             return;
         }
 
@@ -457,7 +481,7 @@ public:
         // cancel_order's eviction of the target plus the cancel command's
         // own synthetic completion just below match_order() internally.
         if (cmd.type != CommandType::CANCEL_ORDER && !exists(local_order.get_id())) {
-            m_telemetry_policy.on_trace_complete(g_telemetry_arena[trace_index(cmd.trace_id)]);
+            complete_trace(m_telemetry_policy, cmd.trace_id);
         }
 
         if (m_gtd_scheduler && cmd.orderType == ORDER_TYPE::GOOD_TILL_DAY && !local_order.is_filled()) {
@@ -474,7 +498,7 @@ public:
         // one (used by the benchmark harness and direct-Order-construction
         // tests) silently diverge.
         if (order.get_type() != ORDER_TYPE::CANCEL && !exists(order.get_id())) {
-            m_telemetry_policy.on_trace_complete(g_telemetry_arena[trace_index(order.m_telemetry_idx)]);
+            complete_trace(m_telemetry_policy, order.m_telemetry_idx);
         }
     }
 
@@ -540,7 +564,7 @@ private:
                 .match_id{0},
                 .reject_reason{RejectReason::UNKNOWN_ORDER}
                 });
-            m_telemetry_policy.on_trace_complete(g_telemetry_arena[trace_index(cmd.trace_id)]);
+            complete_trace(m_telemetry_policy, cmd.trace_id);
             return;
         }
 
@@ -561,7 +585,7 @@ private:
                 .match_id{0},
                 .reject_reason{RejectReason::PRICE_OUT_OF_RANGE}
                 });
-            m_telemetry_policy.on_trace_complete(g_telemetry_arena[trace_index(cmd.trace_id)]);
+            complete_trace(m_telemetry_policy, cmd.trace_id);
             return;
         }
 
@@ -584,7 +608,17 @@ private:
         // so limit() — not the full match_order() type dispatch — is always
         // the right path for whatever type was inherited above.
         if (!exists(replacement.get_id())) {
-            m_telemetry_policy.on_trace_complete(g_telemetry_arena[trace_index(cmd.trace_id)]);
+            complete_trace(m_telemetry_policy, cmd.trace_id);
+        }
+
+        // Same as ENTER_ORDER's own GTD scheduling below in submit_order — a
+        // replacement that's still GOOD_TILL_DAY and ended up resting needs
+        // its own fresh 4pm auto-cancel; the original order's now-stale
+        // schedule (under the old token) safely no-ops when it fires, since
+        // OrderTokenRegistry never repoints an old token and OrderId is
+        // never recycled, but it doesn't cover the replacement at all.
+        if (m_gtd_scheduler && type == ORDER_TYPE::GOOD_TILL_DAY && exists(replacement.get_id())) {
+            m_gtd_scheduler->schedule_cancel(cmd.orderToken, today_4pm_est_utc());
         }
     }
 
@@ -596,7 +630,7 @@ private:
             // trace (already closed out inside cancel_order, if it was found).
             // Emitted unconditionally, whether or not a target was found, so
             // cancel latency is always observable.
-            m_telemetry_policy.on_trace_complete(g_telemetry_arena[trace_index(order.m_telemetry_idx)]);
+            complete_trace(m_telemetry_policy, order.m_telemetry_idx);
         }
         else if (order.get_type() == ORDER_TYPE::LIMIT) {
             limit(order);
