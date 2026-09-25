@@ -70,6 +70,11 @@ public:
         m_udpFd = -1;
     }
 
+    // True once rxLoop has given up on a gap it can never recover from (see
+    // rxLoop's FATAL branch). Polled by main() alongside its own shutdown
+    // flag — this replica cannot be trusted to keep running.
+    bool hitUnrecoverableGap() const { return m_hitUnrecoverableGap.load(std::memory_order_relaxed); }
+
 private:
     using Message = SequencedInboundMessage<TCommand>;
 
@@ -91,8 +96,21 @@ private:
                 if (msg.sequenceNumber > expectedSeq) {
                     uint64_t gapCount = msg.sequenceNumber - expectedSeq;
                     if (!requestRetransmit(expectedSeq, gapCount)) {
-                        std::cerr << "[WARNING] Gap-fill failed; resyncing to live sequence "
-                            << msg.sequenceNumber << "\n";
+                        // Unrecoverable: SequenceStore is a ring buffer that only
+                        // moves forward, so once a range is evicted it is gone for
+                        // good — no future retry, restart included, can ever fill
+                        // it. This replica's book is now permanently incomplete
+                        // and cannot be trusted with anything further. Stop rather
+                        // than silently continuing on known-wrong state; main()
+                        // polls hitUnrecoverableGap() and shuts the process down,
+                        // and ReplicaArbiter's existing heartbeat-staleness check
+                        // excludes a gone replica from leadership exactly like a
+                        // crash would — no separate signaling needed.
+                        std::cerr << "[FATAL] Unrecoverable sequence gap [" << expectedSeq << ", "
+                            << msg.sequenceNumber << "); this replica's book is permanently "
+                            << "incomplete, stopping.\n";
+                        m_hitUnrecoverableGap.store(true, std::memory_order_relaxed);
+                        return;
                     }
                 }
                 expectedSeq = msg.sequenceNumber;
@@ -214,4 +232,5 @@ private:
     std::atomic<bool> m_running{ false };
     std::thread m_worker;
     int m_udpFd{ -1 };
+    std::atomic<bool> m_hitUnrecoverableGap{ false };
 };

@@ -1645,6 +1645,77 @@ TEST(NetworkIngressPipelineTest, ReceiverRecoversGapViaRetransmitServer) {
     retransmitServer.stop();
 }
 
+TEST(NetworkIngressPipelineTest, UnrecoverableGapStopsProcessingLiveTraffic) {
+    // Deliberately never append()'d — every sequence read returns
+    // NOT_YET_ARRIVED, simulating a gap so large the ring buffer never held
+    // any of it (equivalent to it having wrapped past the whole range).
+    SequenceStore<OuchOrderCommand> store("/tmp/eceo_test_seq_store_unrecoverable_gap.dat", 1024);
+
+    RetransmitServer<OuchOrderCommand> retransmitServer(store, 45103);
+    retransmitServer.start();
+
+    NetworkConfig config;
+    config.multicastIp = "239.255.0.9";
+    config.multicastPort = 25109;
+    config.retransmitServerIp = "127.0.0.1";
+    config.retransmitServerPort = 45103;
+
+    SPSCQueue<OuchOrderCommand> inboundQueue;
+    MulticastIngressReceiver<OuchOrderCommand> receiver(inboundQueue, config);
+    receiver.start();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    int senderFd = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(senderFd, 0);
+    sockaddr_in destAddr{};
+    destAddr.sin_family = AF_INET;
+    destAddr.sin_port = htons(config.multicastPort);
+    inet_pton(AF_INET, config.multicastIp.c_str(), &destAddr.sin_addr);
+
+    // The receiver expects seq 0; this arrives as seq 50, so it detects a
+    // [0,50) gap and tries to recover it — impossible, the store is empty.
+    SequencedInboundMessage<OuchOrderCommand> farAhead{};
+    farAhead.sequenceNumber = 50;
+    farAhead.ingressTaiNs = 1;
+    farAhead.clientSessionId = 1;
+    farAhead.command.trace_id = 900;
+    farAhead.command.type = CommandType::ENTER_ORDER;
+    farAhead.command.shares = 100;
+    farAhead.command.price = 10;
+    farAhead.command.buySellIndicator = 'B';
+    std::memcpy(farAhead.command.orderToken, "UNRECOVERABLE1", 14);
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(farAhead)),
+        sendto(senderFd, &farAhead, sizeof(farAhead), 0, (sockaddr*)&destAddr, sizeof(destAddr)));
+
+    OuchOrderCommand received{};
+    EXPECT_FALSE(WaitForPop(inboundQueue, received, std::chrono::milliseconds(500)))
+        << "An unrecoverable gap should stop processing, not push the live message that revealed it";
+    EXPECT_TRUE(receiver.hitUnrecoverableGap());
+
+    // A later live message should also never be processed — rxLoop actually
+    // returned, it isn't just slow.
+    SequencedInboundMessage<OuchOrderCommand> later{};
+    later.sequenceNumber = 51;
+    later.ingressTaiNs = 2;
+    later.clientSessionId = 1;
+    later.command.trace_id = 901;
+    later.command.type = CommandType::ENTER_ORDER;
+    later.command.shares = 200;
+    later.command.price = 20;
+    later.command.buySellIndicator = 'S';
+    std::memcpy(later.command.orderToken, "UNRECOVERABLE2", 14);
+    sendto(senderFd, &later, sizeof(later), 0, (sockaddr*)&destAddr, sizeof(destAddr));
+    close(senderFd);
+
+    OuchOrderCommand shouldNotArrive{};
+    EXPECT_FALSE(WaitForPop(inboundQueue, shouldNotArrive, std::chrono::milliseconds(300)))
+        << "rxLoop should have already returned; no further live traffic should be processed";
+
+    receiver.stop();
+    retransmitServer.stop();
+}
+
 TEST(NetworkIngressPipelineTest, TelemetryIsCapturedConsistentlyAcrossStages) {
     SymbolRegistry registry;
     registry.registerSymbol("TEST");

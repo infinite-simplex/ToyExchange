@@ -102,7 +102,7 @@ int main(int argc, char** argv) {
     egressPublisher.start();
 
     if (statsIntervalMs > 0) {
-        while (!g_shutdownRequested.load(std::memory_order_relaxed)) {
+        while (!g_shutdownRequested.load(std::memory_order_relaxed) && !receiver.hitUnrecoverableGap()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(statsIntervalMs));
             std::cout << "[" << replicaId << "] best bid=" << static_cast<int>(book.get_best_bid())
                       << " best ask=" << static_cast<int>(book.get_best_ask())
@@ -110,15 +110,19 @@ int main(int argc, char** argv) {
                       << " epoch=" << heartbeatClient.currentEpoch() << "\n";
         }
     } else {
-        while (!g_shutdownRequested.load(std::memory_order_relaxed)) {
+        while (!g_shutdownRequested.load(std::memory_order_relaxed) && !receiver.hitUnrecoverableGap()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
     }
 
+    if (receiver.hitUnrecoverableGap()) {
+        std::cerr << "MatchingService[" << replicaId << "] stopping: unrecoverable sequence gap, "
+                  << "this replica's book can no longer be trusted.\n";
+    }
     std::cout << "MatchingService[" << replicaId << "] shutting down...\n";
     egressPublisher.stop();
     heartbeatClient.stop();
     matcher.stop();
     receiver.stop();
-    return 0;
+    return receiver.hitUnrecoverableGap() ? 2 : 0;
 }
