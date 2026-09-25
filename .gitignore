@@ -35,3 +35,4 @@ compile_commands.json
 log.txt
 latencies.txt
 *.dat
+/run/

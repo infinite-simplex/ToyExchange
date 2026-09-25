@@ -43,6 +43,14 @@ struct NetworkConfig {
     // is allowed to actually publish egress at a time.
     uint16_t arbitrationPort = 40003;
 
+    // Internal telemetry channel: each MatchingService replica's
+    // TelemetryForwarder unicasts a TelemetryReport per completed OrderTrace
+    // here; PerformanceServiceApp binds this port to build one canonical,
+    // centralized view of every replica's engine performance. Point-to-point
+    // (not multicast) since there is exactly one intended receiver.
+    std::string performanceServiceIp = "127.0.0.1";
+    uint16_t performanceServicePort = 40002;
+
     // Pre-configured authorized traders
     std::vector<ClientSessionConfig> authorizedClients;
 };

@@ -135,6 +135,7 @@ private:
     bool pushWithTelemetry(const Message& msg) {
         OrderTrace& trace = g_telemetry_arena[trace_index(msg.command.trace_id)];
         trace.ingress_tai_ns = msg.ingressTaiNs;
+        trace.replica_ingress_tai_ns = get_synced_time_ns();
 
         uint64_t start = get_time();
         while (!m_inboundQueue.try_push(msg.command)) {

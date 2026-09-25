@@ -11,6 +11,10 @@
 #include "OuchOrderCommand.hpp"
 #include "HeartbeatMessage.hpp"
 #include "ReplicaArbiter.hpp"
+#include "TelemetryForwarder.hpp"
+#include "TelemetryReceiver.hpp"
+#include "TelemetryReport.hpp"
+#include "Aggregator.hpp"
 #include <IGoodTillDayScheduler.hpp>
 #include <vector>
 #include <cstring>
@@ -1748,6 +1752,18 @@ TEST(NetworkIngressPipelineTest, TelemetryIsCapturedConsistentlyAcrossStages) {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
+    // g_telemetry_arena is one process-wide global shared by every test in
+    // this binary, and trace_index(0) is where every directly-constructed
+    // MatchingEngineTest Order lands too (m_telemetry_idx defaults to 0
+    // there). price_levels_touched/resting_orders_touched can already be
+    // nonzero here from unrelated crossing tests that ran earlier in this
+    // process — snapshot before sending, so the assertions below check what
+    // THIS order's flow actually changed, not an absolute value that would
+    // be flaky depending on test execution order.
+    OrderTrace& trace = g_telemetry_arena[trace_index(0)];
+    const auto priceLevelsBefore = trace.price_levels_touched;
+    const auto restingOrdersBefore = trace.resting_orders_touched;
+
     int clientFd = socket(AF_INET, SOCK_STREAM, 0);
     ASSERT_GE(clientFd, 0);
     sockaddr_in serverAddr{};
@@ -1771,7 +1787,6 @@ TEST(NetworkIngressPipelineTest, TelemetryIsCapturedConsistentlyAcrossStages) {
     OrderEvent accepted{};
     ASSERT_TRUE(WaitForPop(eventQ, accepted)) << "Order was never accepted by the book";
 
-    OrderTrace& trace = g_telemetry_arena[trace_index(0)];
     // match_done_tai_ns is written just after submit_order() returns, which
     // can land a hair after the ACCEPTED event popped above — give it a moment.
     for (int i = 0; i < 200 && trace.match_done_tai_ns == 0; ++i) {
@@ -1779,10 +1794,18 @@ TEST(NetworkIngressPipelineTest, TelemetryIsCapturedConsistentlyAcrossStages) {
     }
 
     EXPECT_NE(0u, trace.ingress_tai_ns) << "NetworkGateway's socket-read timestamp never made it into the arena";
+    EXPECT_NE(0u, trace.replica_ingress_tai_ns)
+        << "MulticastIngressReceiver's own receipt timestamp never made it into the arena";
+    EXPECT_GE(trace.replica_ingress_tai_ns, trace.ingress_tai_ns)
+        << "the replica can't receive a packet before the gateway sent it";
     EXPECT_NE(0u, trace.engine_pop_tai_ns) << "MatchingService's queue-pop timestamp never made it into the arena";
     EXPECT_NE(0u, trace.match_done_tai_ns) << "MatchingService's post-submit timestamp never made it into the arena";
     EXPECT_GE(trace.match_done_tai_ns, trace.engine_pop_tai_ns)
         << "match_done_tai_ns and engine_pop_tai_ns are both stamped from the same thread in sequence";
+    EXPECT_EQ(priceLevelsBefore, trace.price_levels_touched)
+        << "a lone order into an empty book never calls walk_price_level";
+    EXPECT_EQ(restingOrdersBefore, trace.resting_orders_touched)
+        << "a lone order into an empty book never calls walk_price_level";
 
     matchingService.stop();
     receiver.stop();
@@ -2011,4 +2034,158 @@ TEST(TelemetryTest, SyncedTimeIsMonotonicAcrossRapidCalls) {
             << "get_synced_time_ns() went backward between two calls a moment apart";
         previous = current;
     }
+}
+
+// =====================================================================
+// PerformanceService — WindowedHistogram / Aggregator / wire path
+// =====================================================================
+
+TEST(WindowedHistogramTest, RecordAndRolloverReportsClosedWindowPercentiles) {
+    WindowedHistogram h;
+    h.init(1, 1'000'000, 3);
+
+    h.record(100);
+    h.record(200);
+    h.record(300);
+
+    // Nothing has rolled over yet — "most recently closed" is still the
+    // untouched slot init() left empty, not the one being written to.
+    EXPECT_EQ(0, h.mostRecentlyClosed()->total_count);
+
+    h.rollover();
+
+    const hdr_histogram* closed = h.mostRecentlyClosed();
+    EXPECT_EQ(3, closed->total_count);
+    EXPECT_EQ(100, hdr_min(closed));
+    EXPECT_EQ(300, hdr_max(closed));
+
+    // The newly active window must be empty — rollover() has to hdr_reset
+    // the slot it just claimed, not just advance the pointer past it.
+    h.record(999);
+    EXPECT_EQ(3, h.mostRecentlyClosed()->total_count)
+        << "recording into the new window must not touch the just-closed one";
+}
+
+TEST(WindowedHistogramTest, RollingMergesRetainedAndActiveWindows) {
+    WindowedHistogram h;
+    h.init(1, 1'000'000, 3);
+
+    h.record(10);
+    h.rollover();
+    h.record(20);
+    h.rollover();
+    h.record(30); // still in the active, not-yet-closed window
+
+    const hdr_histogram* merged = h.rolling();
+    EXPECT_EQ(3, merged->total_count);
+    EXPECT_EQ(10, hdr_min(merged));
+    EXPECT_EQ(30, hdr_max(merged));
+}
+
+TEST(AggregatorTest, RecordRoutesToCorrectReplicaWithoutCrossContamination) {
+    Aggregator agg;
+
+    TelemetryReport reportA{};
+    reportA.replicaId = 1;
+    reportA.trace.engine_pop_tai_ns = 1'000;
+    reportA.trace.match_done_tai_ns = 1'500; // engine exec = 500ns
+
+    TelemetryReport reportB{};
+    reportB.replicaId = 2;
+    reportB.trace.engine_pop_tai_ns = 2'000;
+    reportB.trace.match_done_tai_ns = 9'000; // engine exec = 7000ns
+
+    agg.record(reportA);
+    agg.record(reportB);
+
+    auto t0 = std::chrono::steady_clock::now();
+    EXPECT_FALSE(agg.maybeRollover(t0)) << "the first call just establishes the window start";
+    EXPECT_TRUE(agg.maybeRollover(t0 + std::chrono::seconds(2), std::chrono::milliseconds(1000)));
+
+    const auto& byReplica = agg.byReplica();
+    ASSERT_EQ(size_t(1), byReplica.count(1));
+    ASSERT_EQ(size_t(1), byReplica.count(2));
+
+    const hdr_histogram* engineA =
+        byReplica.at(1).metrics[metric_index(MetricKind::EngineExecutionNs)].mostRecentlyClosed();
+    const hdr_histogram* engineB =
+        byReplica.at(2).metrics[metric_index(MetricKind::EngineExecutionNs)].mostRecentlyClosed();
+
+    EXPECT_EQ(1, engineA->total_count);
+    EXPECT_EQ(500, hdr_min(engineA));
+    EXPECT_EQ(1, engineB->total_count);
+    EXPECT_EQ(7000, hdr_min(engineB));
+}
+
+TEST(AggregatorTest, IgnoresIncompleteTimestampPairs) {
+    Aggregator agg;
+
+    TelemetryReport report{};
+    report.replicaId = 1;
+    report.trace.engine_pop_tai_ns = 0; // never populated, e.g. a reject path
+    report.trace.match_done_tai_ns = 5000;
+
+    agg.record(report);
+
+    auto t0 = std::chrono::steady_clock::now();
+    agg.maybeRollover(t0);
+    agg.maybeRollover(t0 + std::chrono::seconds(2), std::chrono::milliseconds(1000));
+
+    const hdr_histogram* engine =
+        agg.byReplica().at(1).metrics[metric_index(MetricKind::EngineExecutionNs)].mostRecentlyClosed();
+    EXPECT_EQ(0, engine->total_count)
+        << "a zeroed timestamp must not produce a bogus underflowed delta";
+}
+
+// End-to-end: TelemetryForwarder -> real UDP socket -> TelemetryReceiver ->
+// Aggregator. The only test that can catch a struct-layout mismatch between
+// sender and receiver — both sides could pass their own isolated unit tests
+// while disagreeing with each other, since that only shows up via an actual
+// memcpy over a socket. Matches this file's existing precedent of wire-
+// testing NetworkGateway/MulticastIngressReceiver end-to-end.
+TEST(PerformanceServiceWireTest, ForwarderReachesReceiverAndAggregator) {
+    SPSCQueue<OrderTrace, 16> sourceQueue;
+
+    NetworkConfig config;
+    config.performanceServiceIp = "127.0.0.1";
+    config.performanceServicePort = 45201;
+
+    Aggregator aggregator;
+    TelemetryReceiver telemetryReceiver(aggregator, config.performanceServicePort);
+    telemetryReceiver.start();
+
+    TelemetryForwarder<16> forwarder(sourceQueue, config, ReplicaId(7));
+    forwarder.start();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    OrderTrace trace{};
+    trace.engine_pop_tai_ns = 1'000;
+    trace.match_done_tai_ns = 1'250; // engine exec = 250ns
+    ASSERT_TRUE(sourceQueue.try_push(trace));
+
+    // recordCount() is the thread-safe part of Aggregator (see its header
+    // comment) — safe to poll from this thread while TelemetryReceiver's
+    // recv-loop thread is still running.
+    bool arrived = false;
+    for (int i = 0; i < 100 && !arrived; ++i) {
+        arrived = aggregator.recordCount() >= 1;
+        if (!arrived) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(arrived) << "TelemetryReport never made it from forwarder to aggregator";
+
+    // Only safe to read byReplica()/query histograms once the only thread
+    // that ever writes to them has been stopped — see Aggregator::byReplica's
+    // doc comment.
+    forwarder.stop();
+    telemetryReceiver.stop();
+
+    auto t0 = std::chrono::steady_clock::now();
+    aggregator.maybeRollover(t0);
+    aggregator.maybeRollover(t0 + std::chrono::seconds(2), std::chrono::milliseconds(1000));
+
+    const hdr_histogram* engine = aggregator.byReplica().at(ReplicaId(7))
+        .metrics[metric_index(MetricKind::EngineExecutionNs)].mostRecentlyClosed();
+    EXPECT_EQ(1, engine->total_count);
+    EXPECT_EQ(250, hdr_min(engine));
 }

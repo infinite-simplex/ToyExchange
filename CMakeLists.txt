@@ -10,10 +10,30 @@ endif()
 
 find_package(Threads REQUIRED)
 
+include(FetchContent)
+
+# HdrHistogram_c: vendored rather than hand-rolled — histogram/percentile
+# computation (log-scale bucket sizing, O(1) recording/querying regardless of
+# sample count) is a solved problem with real edge cases, not core
+# learning-value territory for this project. Disable its log-file feature
+# (needs zlib, which nothing else here depends on), its own tests/examples,
+# and its shared-library variant (this repo only ever builds STATIC libs).
+# Must resolve before add_subdirectory(PerformanceService) below, since that
+# directory links the real static target, not just EngineTests.
+FetchContent_Declare(
+  hdr_histogram
+  URL https://github.com/HdrHistogram/HdrHistogram_c/archive/refs/tags/0.11.10.zip
+)
+set(HDR_LOG_REQUIRED "DISABLED" CACHE STRING "" FORCE)
+set(HDR_HISTOGRAM_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(HDR_HISTOGRAM_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(hdr_histogram)
+
 # Subdirectories
 add_subdirectory(ExchangeCommon)
 add_subdirectory(MatchingService)
 add_subdirectory(NetworkService)
+add_subdirectory(PerformanceService)
 add_subdirectory(Tools/OuchTestClient)
 
 # Main Executable
@@ -31,7 +51,6 @@ target_link_libraries(ExchangeMain
 # ==============================================================================
 enable_testing()
 
-include(FetchContent)
 FetchContent_Declare(
   googletest
   URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
@@ -48,7 +67,9 @@ target_link_libraries(EngineTests
         gtest_main
         MatchingService
         NetworkService
+        PerformanceService
         ExchangeCommon
+        hdr_histogram::hdr_histogram_static
         Threads::Threads
 )
 

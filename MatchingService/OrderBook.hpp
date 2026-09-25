@@ -306,15 +306,11 @@ private:
     Quantity walk_price_level(Price p, PriceLevel& priceLevel, Order& order) {
         Quantity takenFromBook{ 0u };
         OrderId curr = priceLevel.m_head;
-#ifdef ENABLE_DETAILED_TELEMETRY
         OrderTrace& trace = g_telemetry_arena[trace_index(order.m_telemetry_idx)];
         ++trace.price_levels_touched;
-#endif
         while (curr != INVALID_IDX && order.get_remaining_quantity() > 0u) {
             auto& topOrder = m_order_pool[curr];
-#ifdef ENABLE_DETAILED_TELEMETRY
             ++trace.resting_orders_touched;
-#endif
             if (topOrder.get_firm_id() == order.get_firm_id()) {
                 //STP prevention, we cancel the aggressive order                
                 m_policy.on_order_event(OrderEvent{

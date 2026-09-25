@@ -13,6 +13,13 @@ struct alignas(64) OrderTrace {
     // a real, cross-machine-comparable wall-clock reading, not a raw TSC
     // cycle count — see get_synced_time_ns() below.
     std::uint64_t ingress_tai_ns{ 0 };         // Nanoseconds since the TAI epoch at socket read
+    std::uint64_t replica_ingress_tai_ns{ 0 }; // Nanoseconds since the TAI epoch when THIS replica's
+                                                // MulticastIngressReceiver actually saw the packet —
+                                                // distinct from ingress_tai_ns (the gateway's own
+                                                // receipt time) so network/replication delay
+                                                // (replica_ingress_tai_ns - ingress_tai_ns) can be told
+                                                // apart from queuing delay
+                                                // (engine_pop_tai_ns - replica_ingress_tai_ns).
     std::uint32_t inbound_q_depth{ 0 };        // SPSC depth at push time
     std::uint64_t inbound_q_submitted{ 0 };    // time taken to add to the queue — purely local
                                                 // (both reads happen on the same machine), so this
@@ -21,11 +28,11 @@ struct alignas(64) OrderTrace {
     // Written by Matching Engine Thread
     std::uint64_t engine_pop_tai_ns{ 0 };      // Nanoseconds since the TAI epoch when popped from queue
     std::uint64_t match_done_tai_ns{ 0 };      // Nanoseconds since the TAI epoch after LOB execution
-#ifdef ENABLE_DETAILED_TELEMETRY
     std::uint32_t resting_orders_touched{ 0 }; // Number of fills generated
     std::uint16_t price_levels_touched{ 0 };   // Number of price levels traversed
-#endif
 };
+static_assert(sizeof(OrderTrace) == 64, "OrderTrace is alignas(64) specifically to fit one cache "
+    "line — a field change that pushes it past 64 bytes doubles the arena's footprint silently.");
 
 // Raw TSC cycles — cheap, high-resolution, but only ever meaningful as a
 // LOCAL relative delta between two reads on the same machine (and ideally

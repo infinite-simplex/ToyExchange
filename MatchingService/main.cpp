@@ -8,6 +8,7 @@
 #include "OrderBook.hpp"
 #include "SPSCProducerPolicy.hpp"
 #include "SPSCQueue.hpp"
+#include "TelemetryForwarder.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -45,6 +46,8 @@ int main(int argc, char** argv) {
         else if (arg == "--egress-port") config.egressMulticastPort = static_cast<uint16_t>(std::stoi(next()));
         else if (arg == "--replica-id") numericReplicaId = static_cast<ReplicaId>(std::stoi(next()));
         else if (arg == "--arbitration-port") config.arbitrationPort = static_cast<uint16_t>(std::stoi(next()));
+        else if (arg == "--performance-service-ip") config.performanceServiceIp = next();
+        else if (arg == "--performance-service-port") config.performanceServicePort = static_cast<uint16_t>(std::stoi(next()));
         else {
             std::cerr << "Unknown argument: " << arg << "\n";
             return 1;
@@ -88,18 +91,21 @@ int main(int argc, char** argv) {
         numericReplicaId, matcher, config);
     EgressPublisher<OrderEvent, 16384, LeaderHeartbeatClient<MatchingService<OuchOrderCommand>>>
         egressPublisher(*eventQueue, config, heartbeatClient);
+    TelemetryForwarder<16384> telemetryForwarder(*traceQueue, config, numericReplicaId);
 
     std::cout << "MatchingService[" << replicaId << "] (replica-id " << numericReplicaId
               << ") starting: joining "
               << config.multicastIp << ":" << config.multicastPort
               << ", retransmit via " << config.retransmitServerIp << ":" << config.retransmitServerPort
               << ", egress to " << config.egressMulticastIp << ":" << config.egressMulticastPort
-              << ", arbitration via " << config.retransmitServerIp << ":" << config.arbitrationPort << "\n";
+              << ", arbitration via " << config.retransmitServerIp << ":" << config.arbitrationPort
+              << ", telemetry to " << config.performanceServiceIp << ":" << config.performanceServicePort << "\n";
 
     receiver.start();
     matcher.start();
     heartbeatClient.start();
     egressPublisher.start();
+    telemetryForwarder.start();
 
     if (statsIntervalMs > 0) {
         while (!g_shutdownRequested.load(std::memory_order_relaxed) && !receiver.hitUnrecoverableGap()) {
@@ -120,6 +126,7 @@ int main(int argc, char** argv) {
                   << "this replica's book can no longer be trusted.\n";
     }
     std::cout << "MatchingService[" << replicaId << "] shutting down...\n";
+    telemetryForwarder.stop();
     egressPublisher.stop();
     heartbeatClient.stop();
     matcher.stop();
