@@ -4,6 +4,7 @@
 #include "MulticastIngressReceiver.hpp"
 #include "RetransmitServer.hpp"
 #include "OuchProtocolHandler.hpp"
+#include "OUCH.hpp"
 #include "SymbolRegistry.hpp"
 #include "OrderTokenRegistry.hpp"
 #include "GtdCancelService.hpp"
@@ -1261,53 +1262,74 @@ TEST_F(MatchingEngineTest, SequenceNumbersAreMonotonicallyIncreasing) {
 
 namespace {
 
-// Builds an OUCH ENTER_ORDER ('O') frame matching OuchProtocolHandler's
-// expected wire layout: [2B BE payloadLen][1B 'O'][14B token][1B side]
-// [1B orderType][4B BE shares][8B symbol][4B BE price][4B BE firmId].
-// firmId defaults to 0 so existing call sites (which predate firmId and
-// implicitly rely on every OUCH order sharing the same firm) don't need to
-// change; pass distinct firmIds to exercise cross-firm matching instead of
-// tripping self-trade prevention.
-std::vector<char> BuildOuchEnterOrderFrame(const char orderToken[14], char buySellIndicator,
-    uint32_t shares, const char symbol[8], uint32_t price, ORDER_TYPE orderType = ORDER_TYPE::LIMIT,
-    uint32_t firmId = 0) {
-    constexpr size_t bodyLen = 14 + 1 + 1 + 4 + 8 + 4 + 4;
-    constexpr uint16_t payloadLen = static_cast<uint16_t>(1 + bodyLen);
+// Any timeInForce value other than the two real OUCH sentinels
+// OuchProtocolHandler maps (0 = IOC, 99998 = "Market Hours"/GTD) falls
+// through to a plain LIMIT order — see OuchProtocolHandler.cpp. Used below
+// as the default so call sites that don't care about order-type selection
+// are unaffected by it.
+constexpr uint32_t TIF_PLAIN_LIMIT = 1;
 
-    std::vector<char> frame(2 + payloadLen);
+// Builds a real, byte-accurate NASDAQ OUCH 4.2 OUCHEnterOrder ('O') frame
+// (see OUCH.hpp), wrapped in this project's own [2B BE payloadLen] envelope.
+// `price` here is in whole cents (this exchange's own Price domain,
+// 0-100) for the caller's convenience; internally it's converted to OUCH's
+// real fixed-point wire convention (dollars * 10000) the same way
+// OuchProtocolHandler decodes it back — see decodePrice() there. firmId
+// defaults to 0 so existing call sites (which predate firmId and implicitly
+// rely on every OUCH order sharing the same firm) don't need to change;
+// pass distinct firmIds to exercise cross-firm matching instead of tripping
+// self-trade prevention.
+std::vector<char> BuildOuchEnterOrderFrame(const char orderToken[14], char buySellIndicator,
+    uint32_t shares, const char symbol[8], uint32_t price, uint32_t timeInForce = TIF_PLAIN_LIMIT,
+    uint32_t firmId = 0) {
+    constexpr uint16_t payloadLen = static_cast<uint16_t>(sizeof(OUCHEnterOrder));
+    uint32_t wirePrice = price * 100; // cents -> OUCH's dollars*10000 fixed point
+
+    std::vector<char> frame(2 + payloadLen, '\0');
     size_t off = 0;
     frame[off++] = static_cast<char>((payloadLen >> 8) & 0xFF);
     frame[off++] = static_cast<char>(payloadLen & 0xFF);
     frame[off++] = 'O';
     std::memcpy(frame.data() + off, orderToken, 14); off += 14;
     frame[off++] = buySellIndicator;
-    frame[off++] = static_cast<char>(orderType);
     frame[off++] = static_cast<char>((shares >> 24) & 0xFF);
     frame[off++] = static_cast<char>((shares >> 16) & 0xFF);
     frame[off++] = static_cast<char>((shares >> 8) & 0xFF);
     frame[off++] = static_cast<char>(shares & 0xFF);
     std::memcpy(frame.data() + off, symbol, 8); off += 8;
-    frame[off++] = static_cast<char>((price >> 24) & 0xFF);
-    frame[off++] = static_cast<char>((price >> 16) & 0xFF);
-    frame[off++] = static_cast<char>((price >> 8) & 0xFF);
-    frame[off++] = static_cast<char>(price & 0xFF);
+    frame[off++] = static_cast<char>((wirePrice >> 24) & 0xFF);
+    frame[off++] = static_cast<char>((wirePrice >> 16) & 0xFF);
+    frame[off++] = static_cast<char>((wirePrice >> 8) & 0xFF);
+    frame[off++] = static_cast<char>(wirePrice & 0xFF);
+    frame[off++] = static_cast<char>((timeInForce >> 24) & 0xFF);
+    frame[off++] = static_cast<char>((timeInForce >> 16) & 0xFF);
+    frame[off++] = static_cast<char>((timeInForce >> 8) & 0xFF);
+    frame[off++] = static_cast<char>(timeInForce & 0xFF);
     frame[off++] = static_cast<char>((firmId >> 24) & 0xFF);
     frame[off++] = static_cast<char>((firmId >> 16) & 0xFF);
     frame[off++] = static_cast<char>((firmId >> 8) & 0xFF);
     frame[off++] = static_cast<char>(firmId & 0xFF);
+    // display / capacity / intermarketSweep / minimumQuantity / crossType /
+    // customerType: real OUCH fields OuchProtocolHandler parses but doesn't
+    // act on yet (see its ENTER_ORDER case) — neutral placeholder values.
+    frame[off++] = 'N'; // display
+    frame[off++] = 'O'; // capacity
+    frame[off++] = 'N'; // intermarketSweep
+    frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; // minimumQuantity
+    frame[off++] = 'N'; // crossType
+    frame[off++] = ' '; // customerType
     return frame;
 }
 
-// Builds an OUCH REPLACE_ORDER ('U') frame matching OuchProtocolHandler's
-// expected wire layout: [2B BE payloadLen]['U'][14B existingToken]
-// [14B newToken][4B BE shares][4B BE price]. Two tokens, not one reused —
-// see OuchProtocolHandler.cpp's REPLACE_ORDER case.
+// Builds a real, byte-accurate OUCHReplaceOrder ('U') frame (see OUCH.hpp).
+// Two tokens, not one reused — see OuchProtocolHandler.cpp's REPLACE_ORDER
+// case. `price` is in whole cents, same convention as BuildOuchEnterOrderFrame.
 std::vector<char> BuildOuchReplaceOrderFrame(const char existingToken[14], const char newToken[14],
     uint32_t shares, uint32_t price) {
-    constexpr size_t bodyLen = 14 + 14 + 4 + 4;
-    constexpr uint16_t payloadLen = static_cast<uint16_t>(1 + bodyLen);
+    constexpr uint16_t payloadLen = static_cast<uint16_t>(sizeof(OUCHReplaceOrder));
+    uint32_t wirePrice = price * 100;
 
-    std::vector<char> frame(2 + payloadLen);
+    std::vector<char> frame(2 + payloadLen, '\0');
     size_t off = 0;
     frame[off++] = static_cast<char>((payloadLen >> 8) & 0xFF);
     frame[off++] = static_cast<char>(payloadLen & 0xFF);
@@ -1318,18 +1340,24 @@ std::vector<char> BuildOuchReplaceOrderFrame(const char existingToken[14], const
     frame[off++] = static_cast<char>((shares >> 16) & 0xFF);
     frame[off++] = static_cast<char>((shares >> 8) & 0xFF);
     frame[off++] = static_cast<char>(shares & 0xFF);
-    frame[off++] = static_cast<char>((price >> 24) & 0xFF);
-    frame[off++] = static_cast<char>((price >> 16) & 0xFF);
-    frame[off++] = static_cast<char>((price >> 8) & 0xFF);
-    frame[off++] = static_cast<char>(price & 0xFF);
+    frame[off++] = static_cast<char>((wirePrice >> 24) & 0xFF);
+    frame[off++] = static_cast<char>((wirePrice >> 16) & 0xFF);
+    frame[off++] = static_cast<char>((wirePrice >> 8) & 0xFF);
+    frame[off++] = static_cast<char>(wirePrice & 0xFF);
+    // timeInForce / display / intermarketSweep / minimumQuantity: real OUCH
+    // fields OuchProtocolHandler parses but discards for REPLACE_ORDER (the
+    // resulting order keeps its existing type) — left zero/neutral.
+    frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; // timeInForce
+    frame[off++] = 'N'; // display
+    frame[off++] = 'N'; // intermarketSweep
+    frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; // minimumQuantity
     return frame;
 }
 
-// Builds an OUCH CANCEL_ORDER ('X') frame matching OuchProtocolHandler's
-// expected wire layout: [2B BE payloadLen]['X'][14B orderToken][4B BE shares].
+// Builds a real, byte-accurate OUCHCancelOrder ('X') frame (see OUCH.hpp) —
+// already identical to this project's original custom layout, unchanged.
 std::vector<char> BuildOuchCancelOrderFrame(const char orderToken[14], uint32_t shares) {
-    constexpr size_t bodyLen = 14 + 4;
-    constexpr uint16_t payloadLen = static_cast<uint16_t>(1 + bodyLen);
+    constexpr uint16_t payloadLen = static_cast<uint16_t>(sizeof(OUCHCancelOrder));
 
     std::vector<char> frame(2 + payloadLen);
     size_t off = 0;
@@ -1391,7 +1419,7 @@ TEST(NetworkIngressPipelineTest, GatewayToReceiverDeliversParsedOrderOverLoopbac
 
     const char orderToken[14] = "TESTTOKEN0001";
     const char symbol[8] = { 'T', 'E', 'S', 'T', ' ', ' ', ' ', ' ' };
-    auto frame = BuildOuchEnterOrderFrame(orderToken, 'B', 100, symbol, 42, ORDER_TYPE::LIMIT, 7);
+    auto frame = BuildOuchEnterOrderFrame(orderToken, 'B', 100, symbol, 42, TIF_PLAIN_LIMIT, 7);
     ASSERT_EQ(static_cast<ssize_t>(frame.size()),
         send(clientFd, frame.data(), frame.size(), 0));
     close(clientFd);
@@ -1455,7 +1483,8 @@ TEST(NetworkIngressPipelineTest, BadBodyLengthClosesTheConnection) {
     gateway.start();
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    // ENTER_ORDER ('O') needs a 36-byte body; send only 10 garbage bytes.
+    // A real ENTER_ORDER ('O') needs a 49-byte frame (sizeof(OUCHEnterOrder));
+    // send only 10 garbage bytes.
     constexpr uint16_t payloadLen = 1 + 10;
     std::vector<char> frame(2 + payloadLen, '\0');
     frame[0] = static_cast<char>((payloadLen >> 8) & 0xFF);
@@ -1493,60 +1522,6 @@ TEST(NetworkIngressPipelineTest, UnrecognizedMessageTypeClosesTheConnection) {
     EXPECT_TRUE(SendFrameAndCheckConnectionClosed(config.ouchListenPort, frame))
         << "an unrecognized message type byte should disconnect, not stall";
 
-    gateway.stop();
-}
-
-TEST(NetworkIngressPipelineTest, UnknownOrderTypeByteIsRejectedNotDisconnected) {
-    SymbolRegistry registry;
-    registry.registerSymbol("TEST");
-    OrderTokenRegistry orderTokenRegistry;
-    OuchProtocolHandler handler(registry, orderTokenRegistry);
-
-    NetworkConfig config;
-    config.ouchListenPort = 15111;
-    config.multicastIp = "239.255.0.12";
-    config.multicastPort = 25112;
-
-    NetworkGateway<OuchProtocolHandler, OuchOrderCommand> gateway(
-        handler, config, "/tmp/eceo_test_seq_store_badordertype.dat", 1024);
-    gateway.start();
-
-    SPSCQueue<OuchOrderCommand> inboundQueue;
-    MulticastIngressReceiver<OuchOrderCommand> receiver(inboundQueue, config);
-    receiver.start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    int clientFd = socket(AF_INET, SOCK_STREAM, 0);
-    ASSERT_GE(clientFd, 0);
-    sockaddr_in serverAddr{};
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(config.ouchListenPort);
-    inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
-    ASSERT_EQ(0, connect(clientFd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
-
-    const char orderToken[14] = "BADORDERTYPE1";
-    const char symbol[8] = { 'T', 'E', 'S', 'T', ' ', ' ', ' ', ' ' };
-    // ORDER_TYPE's highest valid value is MARKET (7) — 99 is well outside it.
-    auto badFrame = BuildOuchEnterOrderFrame(orderToken, 'B', 50, symbol, 40, static_cast<ORDER_TYPE>(99));
-    ASSERT_EQ(static_cast<ssize_t>(badFrame.size()), send(clientFd, badFrame.data(), badFrame.size(), 0));
-
-    OuchOrderCommand invalid{};
-    ASSERT_TRUE(WaitForPop(inboundQueue, invalid)) << "the malformed-content frame never arrived";
-    EXPECT_EQ(CommandType::INVALID, invalid.type);
-    EXPECT_EQ(RejectReason::INVALID_ORDER_TYPE, invalid.invalidReason);
-
-    // Connection must still be open — a second, valid frame should still work.
-    const char orderToken2[14] = "VALIDAFTERBAD";
-    auto goodFrame = BuildOuchEnterOrderFrame(orderToken2, 'S', 25, symbol, 60);
-    ASSERT_EQ(static_cast<ssize_t>(goodFrame.size()), send(clientFd, goodFrame.data(), goodFrame.size(), 0));
-
-    OuchOrderCommand valid{};
-    ASSERT_TRUE(WaitForPop(inboundQueue, valid)) << "connection was closed when it shouldn't have been";
-    EXPECT_EQ(CommandType::ENTER_ORDER, valid.type);
-    EXPECT_EQ(0, std::memcmp(orderToken2, valid.orderToken, 14));
-
-    close(clientFd);
-    receiver.stop();
     gateway.stop();
 }
 
@@ -1596,6 +1571,192 @@ TEST(NetworkIngressPipelineTest, UnknownSymbolIsRejectedNotDisconnected) {
     OuchOrderCommand valid{};
     ASSERT_TRUE(WaitForPop(inboundQueue, valid)) << "connection was closed when it shouldn't have been";
     EXPECT_EQ(CommandType::ENTER_ORDER, valid.type);
+
+    close(clientFd);
+    receiver.stop();
+    gateway.stop();
+}
+
+// Regression test for a real narrowing bug: outCmd.price = readBE32(...)
+// used to assign a decoded uint32_t straight into Price (uint8_t) with no
+// bounds check, so an out-of-range wire price would silently wrap instead
+// of being rejected (e.g. 300 -> 44, which then passed OrderBook's own
+// downstream `cmd.price > WORST_ASK` check). decodePrice() in
+// OuchProtocolHandler.cpp now bounds-checks before narrowing.
+TEST(NetworkIngressPipelineTest, OutOfRangePriceIsRejectedNotDisconnected) {
+    SymbolRegistry registry;
+    registry.registerSymbol("TEST");
+    OrderTokenRegistry orderTokenRegistry;
+    OuchProtocolHandler handler(registry, orderTokenRegistry);
+
+    NetworkConfig config;
+    config.ouchListenPort = 15111;
+    config.multicastIp = "239.255.0.14";
+    config.multicastPort = 25112;
+
+    NetworkGateway<OuchProtocolHandler, OuchOrderCommand> gateway(
+        handler, config, "/tmp/eceo_test_seq_store_badprice.dat", 1024);
+    gateway.start();
+
+    SPSCQueue<OuchOrderCommand> inboundQueue;
+    MulticastIngressReceiver<OuchOrderCommand> receiver(inboundQueue, config);
+    receiver.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    int clientFd = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(clientFd, 0);
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(config.ouchListenPort);
+    inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
+    ASSERT_EQ(0, connect(clientFd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
+
+    const char orderToken[14] = "BADPRICETOKN1";
+    const char symbol[8] = { 'T', 'E', 'S', 'T', ' ', ' ', ' ', ' ' };
+    // 300 cents is well outside [WORST_BID, WORST_ASK] = [0, 100]. Before
+    // decodePrice()'s bounds check existed, this would have silently
+    // wrapped to 44 (300 mod 256) and passed OrderBook's own check instead.
+    auto badFrame = BuildOuchEnterOrderFrame(orderToken, 'B', 50, symbol, 300);
+    ASSERT_EQ(static_cast<ssize_t>(badFrame.size()), send(clientFd, badFrame.data(), badFrame.size(), 0));
+
+    OuchOrderCommand invalid{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, invalid)) << "the malformed-content frame never arrived";
+    EXPECT_EQ(CommandType::INVALID, invalid.type);
+    EXPECT_EQ(RejectReason::PRICE_OUT_OF_RANGE, invalid.invalidReason);
+
+    const char orderToken2[14] = "VALIDAFTERBD3";
+    auto goodFrame = BuildOuchEnterOrderFrame(orderToken2, 'S', 25, symbol, 60);
+    ASSERT_EQ(static_cast<ssize_t>(goodFrame.size()), send(clientFd, goodFrame.data(), goodFrame.size(), 0));
+
+    OuchOrderCommand valid{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, valid)) << "connection was closed when it shouldn't have been";
+    EXPECT_EQ(CommandType::ENTER_ORDER, valid.type);
+
+    close(clientFd);
+    receiver.stop();
+    gateway.stop();
+}
+
+// Builds a real OUCHEnterOrder frame with the price field set to a raw
+// wire value directly (not routed through BuildOuchEnterOrderFrame's own
+// cents*100 convenience conversion), so this test can't pass just because
+// the builder's conversion and the parser's decode happen to cancel out —
+// it locks in the actual OUCH fixed-point convention (dollars * 10000)
+// independently of this file's own test helpers.
+TEST(NetworkIngressPipelineTest, RealOuchFixedPointPriceIsDecodedToCents) {
+    SymbolRegistry registry;
+    uint16_t expectedStockLocate = registry.registerSymbol("TEST");
+    OrderTokenRegistry orderTokenRegistry;
+    OuchProtocolHandler handler(registry, orderTokenRegistry);
+
+    NetworkConfig config;
+    config.ouchListenPort = 15113;
+    config.multicastIp = "239.255.0.15";
+    config.multicastPort = 25116;
+
+    NetworkGateway<OuchProtocolHandler, OuchOrderCommand> gateway(
+        handler, config, "/tmp/eceo_test_seq_store_fixedpoint.dat", 1024);
+    gateway.start();
+
+    SPSCQueue<OuchOrderCommand> inboundQueue;
+    MulticastIngressReceiver<OuchOrderCommand> receiver(inboundQueue, config);
+    receiver.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    int clientFd = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(clientFd, 0);
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(config.ouchListenPort);
+    inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
+    ASSERT_EQ(0, connect(clientFd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
+
+    OUCHEnterOrder wire{};
+    wire.messageType = 'O';
+    std::memcpy(wire.orderToken, "FIXEDPOINTTOK", 14);
+    wire.buySellIndicator = 'B';
+    wire.shares = htonl(100);
+    std::memcpy(wire.stock, "TEST    ", 8);
+    wire.price = htonl(4200); // real OUCH fixed point for "$0.42" -> 42 cents
+    wire.timeInForce = htonl(1);
+    std::memcpy(wire.mpid, "    ", 4);
+    wire.display = 'N';
+    wire.capacity = 'O';
+    wire.intermarketSweep = 'N';
+    wire.minimumQuantity = 0;
+    wire.crossType = 'N';
+    wire.customerType = ' ';
+
+    uint16_t payloadLen = static_cast<uint16_t>(sizeof(OUCHEnterOrder));
+    std::vector<char> frame(2 + payloadLen);
+    frame[0] = static_cast<char>((payloadLen >> 8) & 0xFF);
+    frame[1] = static_cast<char>(payloadLen & 0xFF);
+    std::memcpy(frame.data() + 2, &wire, sizeof(OUCHEnterOrder));
+
+    ASSERT_EQ(static_cast<ssize_t>(frame.size()), send(clientFd, frame.data(), frame.size(), 0));
+    close(clientFd);
+
+    OuchOrderCommand received{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, received)) << "Order never arrived at MulticastIngressReceiver's queue";
+
+    EXPECT_EQ(CommandType::ENTER_ORDER, received.type);
+    EXPECT_EQ(Price(42), received.price);
+    EXPECT_EQ(expectedStockLocate, received.stockLocate);
+
+    receiver.stop();
+    gateway.stop();
+}
+
+// OuchProtocolHandler recovers ORDER_TYPE from timeInForce, since real OUCH
+// has no order-type byte: 0 = IOC, 99998 = "Market Hours" (this exchange's
+// own GOOD_TILL_DAY), everything else falls through to a plain LIMIT order.
+TEST(NetworkIngressPipelineTest, TimeInForceMapsToOrderType) {
+    SymbolRegistry registry;
+    registry.registerSymbol("TEST");
+    OrderTokenRegistry orderTokenRegistry;
+    OuchProtocolHandler handler(registry, orderTokenRegistry);
+
+    NetworkConfig config;
+    config.ouchListenPort = 15114;
+    config.multicastIp = "239.255.0.16";
+    config.multicastPort = 25117;
+
+    NetworkGateway<OuchProtocolHandler, OuchOrderCommand> gateway(
+        handler, config, "/tmp/eceo_test_seq_store_tifmap.dat", 1024);
+    gateway.start();
+
+    SPSCQueue<OuchOrderCommand> inboundQueue;
+    MulticastIngressReceiver<OuchOrderCommand> receiver(inboundQueue, config);
+    receiver.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    int clientFd = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(clientFd, 0);
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(config.ouchListenPort);
+    inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
+    ASSERT_EQ(0, connect(clientFd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
+
+    const char symbol[8] = { 'T', 'E', 'S', 'T', ' ', ' ', ' ', ' ' };
+    struct Case { const char* token; uint32_t timeInForce; ORDER_TYPE expected; };
+    const Case cases[] = {
+        { "TIF-IOC000001", 0,     ORDER_TYPE::IMMEDIATE_OR_CANCEL },
+        { "TIF-GTD000001", 99998, ORDER_TYPE::GOOD_TILL_DAY },
+        { "TIF-LIMIT00001", 500,  ORDER_TYPE::LIMIT },
+    };
+
+    for (const auto& c : cases) {
+        char token[14];
+        std::memcpy(token, c.token, 14);
+        auto frame = BuildOuchEnterOrderFrame(token, 'B', 50, symbol, 40, c.timeInForce);
+        ASSERT_EQ(static_cast<ssize_t>(frame.size()), send(clientFd, frame.data(), frame.size(), 0));
+
+        OuchOrderCommand received{};
+        ASSERT_TRUE(WaitForPop(inboundQueue, received)) << "order for timeInForce=" << c.timeInForce << " never arrived";
+        EXPECT_EQ(CommandType::ENTER_ORDER, received.type);
+        EXPECT_EQ(c.expected, received.orderType) << "wrong ORDER_TYPE for timeInForce=" << c.timeInForce;
+    }
 
     close(clientFd);
     receiver.stop();
@@ -1810,8 +1971,8 @@ TEST(NetworkIngressPipelineTest, DistinctFirmIdsAllowOuchOrdersToMatch) {
     // Resting ask from firm 1, crossed by a bid from firm 2 — distinct firm
     // ids, so self-trade prevention must not block this (see OuchOrderCommand
     // ::firmId and OrderBook::create_order_from_command).
-    sendFrame(BuildOuchEnterOrderFrame(askToken, 'S', 50, symbol, 40, ORDER_TYPE::LIMIT, 1));
-    sendFrame(BuildOuchEnterOrderFrame(bidToken, 'B', 50, symbol, 40, ORDER_TYPE::LIMIT, 2));
+    sendFrame(BuildOuchEnterOrderFrame(askToken, 'S', 50, symbol, 40, TIF_PLAIN_LIMIT, 1));
+    sendFrame(BuildOuchEnterOrderFrame(bidToken, 'B', 50, symbol, 40, TIF_PLAIN_LIMIT, 2));
 
     OrderEvent evt{};
     bool sawExecuted = false;
@@ -2105,7 +2266,10 @@ TEST(NetworkIngressPipelineTest, GtdCancelServiceFiresScheduledCancelWithinBound
 
     const char orderToken[14] = "GTDSVCTOKEN01";
     const char symbol[8] = { 'T', 'E', 'S', 'T', ' ', ' ', ' ', ' ' };
-    auto frame = BuildOuchEnterOrderFrame(orderToken, 'B', 100, symbol, 40, ORDER_TYPE::GOOD_TILL_CANCEL);
+    // This test only exercises GtdCancelService's own TCP-send machinery via
+    // an externally-scheduled cancel below — it doesn't depend on the
+    // order's own ORDER_TYPE, so the default (plain LIMIT) is fine here.
+    auto frame = BuildOuchEnterOrderFrame(orderToken, 'B', 100, symbol, 40);
     ASSERT_EQ(static_cast<ssize_t>(frame.size()),
         send(clientFd, frame.data(), frame.size(), 0));
     close(clientFd);

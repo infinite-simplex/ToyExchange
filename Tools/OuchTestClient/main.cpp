@@ -2,12 +2,12 @@
 // OUCH TCP listener and sends one or more ENTER_ORDER frames. Deliberately
 // decoupled from NetworkService/MatchingService internal types (it's meant
 // to simulate an external client, not reuse OuchOrderCommand) — the frame
-// layout is duplicated here from OuchProtocolHandler.cpp's assumed wire
-// format (see NetworkService/OuchProtocolHandler.cpp), the same layout
+// layout is duplicated here, hand-matched to the real, byte-accurate NASDAQ
+// OUCH 4.2 structs in NetworkService/OUCH_ITCH/OUCH.hpp (not included
+// directly, per this file's own decoupling — see OuchProtocolHandler.cpp
+// for the parser that decodes these same bytes), the same layout
 // Testing.cpp's BuildOuchEnterOrderFrame helper builds for the ingress
 // pipeline tests.
-#include "OrderTypes.hpp"
-
 #include <arpa/inet.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -24,47 +24,70 @@
 
 namespace {
 
-// [2B BE payloadLen][1B 'O'][14B token][1B side][1B orderType]
-// [4B BE shares][8B symbol][4B BE price][4B BE firmId]
+// Real OUCH 4.2 OUCHEnterOrder body (see OUCH.hpp), wrapped in this
+// project's own [2B BE payloadLen] envelope: [1B 'O'][14B token][1B side]
+// [4B BE shares][8B symbol][4B BE price][4B BE timeInForce][4B BE mpid]
+// [1B display][1B capacity][1B intermarketSweep][4B BE minimumQuantity]
+// [1B crossType][1B customerType]. `price` here is in whole cents (this
+// exchange's own Price domain, 0-100); converted to OUCH's real fixed-point
+// wire convention (dollars * 10000) the same way OuchProtocolHandler
+// decodes it back — see decodePrice() there.
 std::vector<char> BuildOuchEnterOrderFrame(const char orderToken[14], char buySellIndicator,
-    uint32_t shares, const char symbol[8], uint32_t price, ORDER_TYPE orderType, uint32_t firmId) {
-    constexpr size_t bodyLen = 14 + 1 + 1 + 4 + 8 + 4 + 4;
+    uint32_t shares, const char symbol[8], uint32_t price, uint32_t timeInForce, uint32_t firmId) {
+    constexpr size_t bodyLen = 14 + 1 + 4 + 8 + 4 + 4 + 4 + 1 + 1 + 1 + 4 + 1 + 1;
     constexpr uint16_t payloadLen = static_cast<uint16_t>(1 + bodyLen);
+    uint32_t wirePrice = price * 100; // cents -> OUCH's dollars*10000 fixed point
 
-    std::vector<char> frame(2 + payloadLen);
+    std::vector<char> frame(2 + payloadLen, '\0');
     size_t off = 0;
     frame[off++] = static_cast<char>((payloadLen >> 8) & 0xFF);
     frame[off++] = static_cast<char>(payloadLen & 0xFF);
     frame[off++] = 'O';
     std::memcpy(frame.data() + off, orderToken, 14); off += 14;
     frame[off++] = buySellIndicator;
-    frame[off++] = static_cast<char>(orderType);
     frame[off++] = static_cast<char>((shares >> 24) & 0xFF);
     frame[off++] = static_cast<char>((shares >> 16) & 0xFF);
     frame[off++] = static_cast<char>((shares >> 8) & 0xFF);
     frame[off++] = static_cast<char>(shares & 0xFF);
     std::memcpy(frame.data() + off, symbol, 8); off += 8;
-    frame[off++] = static_cast<char>((price >> 24) & 0xFF);
-    frame[off++] = static_cast<char>((price >> 16) & 0xFF);
-    frame[off++] = static_cast<char>((price >> 8) & 0xFF);
-    frame[off++] = static_cast<char>(price & 0xFF);
+    frame[off++] = static_cast<char>((wirePrice >> 24) & 0xFF);
+    frame[off++] = static_cast<char>((wirePrice >> 16) & 0xFF);
+    frame[off++] = static_cast<char>((wirePrice >> 8) & 0xFF);
+    frame[off++] = static_cast<char>(wirePrice & 0xFF);
+    frame[off++] = static_cast<char>((timeInForce >> 24) & 0xFF);
+    frame[off++] = static_cast<char>((timeInForce >> 16) & 0xFF);
+    frame[off++] = static_cast<char>((timeInForce >> 8) & 0xFF);
+    frame[off++] = static_cast<char>(timeInForce & 0xFF);
     frame[off++] = static_cast<char>((firmId >> 24) & 0xFF);
     frame[off++] = static_cast<char>((firmId >> 16) & 0xFF);
     frame[off++] = static_cast<char>((firmId >> 8) & 0xFF);
     frame[off++] = static_cast<char>(firmId & 0xFF);
+    // display / capacity / intermarketSweep / minimumQuantity / crossType /
+    // customerType: real OUCH fields OuchProtocolHandler parses but doesn't
+    // act on yet — neutral placeholder values.
+    frame[off++] = 'N'; // display
+    frame[off++] = 'O'; // capacity
+    frame[off++] = 'N'; // intermarketSweep
+    frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; // minimumQuantity
+    frame[off++] = 'N'; // crossType
+    frame[off++] = ' '; // customerType
     return frame;
 }
 
-// [2B BE payloadLen]['U'][14B existingToken][14B newToken][4B BE shares][4B BE price]
-// Matches OuchProtocolHandler.cpp's REPLACE_ORDER case: two tokens (the
-// order being replaced, and the new one identifying the result), not one
-// token reused — a token identifies one specific order instance.
+// Real OUCH 4.2 OUCHReplaceOrder body (see OUCH.hpp): [1B 'U']
+// [14B existingToken][14B newToken][4B BE shares][4B BE price]
+// [4B BE timeInForce][1B display][1B intermarketSweep][4B BE minimumQuantity].
+// Two tokens (the order being replaced, and the new one identifying the
+// result), not one token reused — a token identifies one specific order
+// instance. `price` is in whole cents, same convention as
+// BuildOuchEnterOrderFrame above.
 std::vector<char> BuildOuchReplaceOrderFrame(const char existingToken[14], const char newToken[14],
     uint32_t shares, uint32_t price) {
-    constexpr size_t bodyLen = 14 + 14 + 4 + 4;
+    constexpr size_t bodyLen = 14 + 14 + 4 + 4 + 4 + 1 + 1 + 4;
     constexpr uint16_t payloadLen = static_cast<uint16_t>(1 + bodyLen);
+    uint32_t wirePrice = price * 100;
 
-    std::vector<char> frame(2 + payloadLen);
+    std::vector<char> frame(2 + payloadLen, '\0');
     size_t off = 0;
     frame[off++] = static_cast<char>((payloadLen >> 8) & 0xFF);
     frame[off++] = static_cast<char>(payloadLen & 0xFF);
@@ -75,10 +98,17 @@ std::vector<char> BuildOuchReplaceOrderFrame(const char existingToken[14], const
     frame[off++] = static_cast<char>((shares >> 16) & 0xFF);
     frame[off++] = static_cast<char>((shares >> 8) & 0xFF);
     frame[off++] = static_cast<char>(shares & 0xFF);
-    frame[off++] = static_cast<char>((price >> 24) & 0xFF);
-    frame[off++] = static_cast<char>((price >> 16) & 0xFF);
-    frame[off++] = static_cast<char>((price >> 8) & 0xFF);
-    frame[off++] = static_cast<char>(price & 0xFF);
+    frame[off++] = static_cast<char>((wirePrice >> 24) & 0xFF);
+    frame[off++] = static_cast<char>((wirePrice >> 16) & 0xFF);
+    frame[off++] = static_cast<char>((wirePrice >> 8) & 0xFF);
+    frame[off++] = static_cast<char>(wirePrice & 0xFF);
+    // timeInForce / display / intermarketSweep / minimumQuantity: real OUCH
+    // fields OuchProtocolHandler parses but discards for REPLACE_ORDER —
+    // left zero/neutral.
+    frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; // timeInForce
+    frame[off++] = 'N'; // display
+    frame[off++] = 'N'; // intermarketSweep
+    frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; // minimumQuantity
     return frame;
 }
 
@@ -193,16 +223,6 @@ void ListenForResponses(int sock, int listenMs) {
     }
 }
 
-ORDER_TYPE ParseOrderType(const std::string& s) {
-    if (s == "LIMIT") return ORDER_TYPE::LIMIT;
-    if (s == "IOC" || s == "IMMEDIATE_OR_CANCEL") return ORDER_TYPE::IMMEDIATE_OR_CANCEL;
-    if (s == "FOK" || s == "FILL_OR_KILL") return ORDER_TYPE::FILL_OR_KILL;
-    if (s == "GTC" || s == "GOOD_TILL_CANCEL") return ORDER_TYPE::GOOD_TILL_CANCEL;
-    if (s == "GTD" || s == "GOOD_TILL_DAY") return ORDER_TYPE::GOOD_TILL_DAY;
-    if (s == "MARKET") return ORDER_TYPE::MARKET;
-    throw std::runtime_error("Unknown --order-type: " + s);
-}
-
 void PrintUsage() {
     std::cerr <<
         "Usage: OuchTestClient --side B|S --price N --qty N [options]\n"
@@ -210,9 +230,15 @@ void PrintUsage() {
         "  --port <port>          default 10001 (NetworkConfig::ouchListenPort)\n"
         "  --symbol <name>        default TEST, space-padded/truncated to 8 bytes\n"
         "  --side B|S             required for a new order (not for --replace-token)\n"
-        "  --price <0-255>        required (Price is uint8_t on the exchange side)\n"
+        "  --price <0-100>        required, whole cents (this exchange's Price\n"
+        "                         domain) — sent on the wire as real OUCH's\n"
+        "                         fixed-point price (dollars * 10000)\n"
         "  --qty <shares>         required\n"
-        "  --order-type <type>    LIMIT (default) | IOC | FOK | GTC | GTD | MARKET\n"
+        "  --time-in-force <n>    real OUCH field, default 1 (plain LIMIT).\n"
+        "                         0 = Immediate or Cancel, 99998 = Market Hours\n"
+        "                         (auto-cancel at close — this exchange's own\n"
+        "                         GOOD_TILL_DAY); any other value is a plain\n"
+        "                         LIMIT order — see OuchProtocolHandler.cpp.\n"
         "  --firm-id <n>          default 0. Self-trade prevention rejects two\n"
         "                         orders sharing a firm id that would otherwise\n"
         "                         cross each other — use different --firm-id\n"
@@ -224,11 +250,11 @@ void PrintUsage() {
         "                         this existing token with one at --price/--qty\n"
         "                         (identified afterward by --token, or an\n"
         "                         auto-generated one if --token isn't given).\n"
-        "                         Ignores --side/--order-type/--firm-id/--count,\n"
+        "                         Ignores --side/--time-in-force/--firm-id/--count,\n"
         "                         which don't apply to a replace.\n"
         "  --cancel-token <text>  send a CANCEL_ORDER instead of ENTER_ORDER,\n"
         "                         canceling the order currently identified by\n"
-        "                         this token. Ignores --side/--price/--order-type/\n"
+        "                         this token. Ignores --side/--price/--time-in-force/\n"
         "                         --firm-id/--count/--replace-token.\n"
         "  --count <n>            send n orders over one connection, default 1\n"
         "  --interval-ms <ms>     delay between sends when --count > 1, default 0\n"
@@ -246,7 +272,7 @@ int main(int argc, char** argv) {
     char side = 0;
     long price = -1;
     long qty = -1;
-    ORDER_TYPE orderType = ORDER_TYPE::LIMIT;
+    uint32_t timeInForce = 1; // real OUCH field; 1 falls through to a plain LIMIT order
     uint32_t firmId = 0;
     std::string tokenOverride;
     std::string replaceToken;
@@ -268,7 +294,7 @@ int main(int argc, char** argv) {
         else if (arg == "--side") side = next()[0];
         else if (arg == "--price") price = std::stol(next());
         else if (arg == "--qty") qty = std::stol(next());
-        else if (arg == "--order-type") orderType = ParseOrderType(next());
+        else if (arg == "--time-in-force") timeInForce = static_cast<uint32_t>(std::stoul(next()));
         else if (arg == "--firm-id") firmId = static_cast<uint32_t>(std::stoul(next()));
         else if (arg == "--token") tokenOverride = next();
         else if (arg == "--replace-token") replaceToken = next();
@@ -291,7 +317,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     bool needsPriceAndSide = !isReplace && !isCancel;
-    if ((needsPriceAndSide && side != 'B' && side != 'S') || (!isCancel && (price < 0 || price > 255))
+    if ((needsPriceAndSide && side != 'B' && side != 'S') || (!isCancel && (price < 0 || price > 100))
         || (!isCancel && qty <= 0)) {
         std::cerr << "Missing/invalid required arguments.\n";
         PrintUsage();
@@ -376,7 +402,7 @@ int main(int argc, char** argv) {
             }
 
             auto frame = BuildOuchEnterOrderFrame(token, side, static_cast<uint32_t>(qty), symbol,
-                static_cast<uint32_t>(price), orderType, firmId);
+                static_cast<uint32_t>(price), timeInForce, firmId);
 
             ssize_t sent = send(sock, frame.data(), frame.size(), 0);
             if (sent != static_cast<ssize_t>(frame.size())) {

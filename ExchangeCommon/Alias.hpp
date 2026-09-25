@@ -3,6 +3,14 @@
 #include <cstdint>
 
 using Price = std::uint8_t;
+// This exchange's whole price domain: event-contract cents, 0-100 inclusive.
+// Lives here (not in MatchingService/OrderBook.hpp, where these used to be
+// #define'd locally) because OuchProtocolHandler (NetworkService) also needs
+// them to bounds-check a real OUCH price on ingress, and NetworkService does
+// not — and should not — link against MatchingService. OrderBook.hpp's own
+// m_price_levels array is indexed directly by Price using these same bounds.
+constexpr Price WORST_BID = 0;
+constexpr Price WORST_ASK = 100;
 using Quantity = std::int32_t;
 using OrderId = std::uint64_t;
 constexpr OrderId INVALID_ORDER_ID = 0; // real ids are assigned starting at 1

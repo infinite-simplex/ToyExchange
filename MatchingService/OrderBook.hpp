@@ -19,8 +19,10 @@
 // already pulls Telemetry.hpp in transitively either way; made explicit
 // and unconditional rather than relying on that transitive include.
 #include "Telemetry.hpp"
-#define WORST_ASK 100
-#define WORST_BID 0
+// WORST_ASK / WORST_BID now live in ExchangeCommon/Alias.hpp (pulled in
+// transitively via OuchOrderCommand.hpp above) — NetworkService's
+// OuchProtocolHandler needs the same bounds to validate a real OUCH price on
+// ingress, and moving them there avoids NetworkService linking MatchingService.
 
 // Limit bounds to realistic limits or maintain full size via heap allocation
 static constexpr std::size_t MAX_GLOBAL_ORDERS = 10'000'000u; // Sized for runtime bounds
