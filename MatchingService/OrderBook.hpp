@@ -435,20 +435,43 @@ public:
                 .match_id{0},
                 .reject_reason{RejectReason::PRICE_OUT_OF_RANGE}
                 });
+            // No Order was ever constructed for this reject, so nothing else
+            // will ever complete this trace_id — do it here directly.
+            m_telemetry_policy.on_trace_complete(g_telemetry_arena[trace_index(cmd.trace_id)]);
             return;
         }
 
         Order local_order = create_order_from_command(cmd);
         match_order(local_order);
 
+        // If the order didn't end up resting — filled completely, rejected
+        // by self-trade prevention, or an IOC/MARKET/FOK order that never
+        // rests by design — its fate is fully decided now and nothing else
+        // will ever complete its trace (unlike a resting order, whose trace
+        // correctly stays open until a later cancel_order/eviction call).
+        // CANCEL_ORDER is excluded: it already fully self-completes via
+        // cancel_order's eviction of the target plus the cancel command's
+        // own synthetic completion just below match_order() internally.
+        if (cmd.type != CommandType::CANCEL_ORDER && !exists(local_order.get_id())) {
+            m_telemetry_policy.on_trace_complete(g_telemetry_arena[trace_index(cmd.trace_id)]);
+        }
+
         if (m_gtd_scheduler && cmd.orderType == ORDER_TYPE::GOOD_TILL_DAY && !local_order.is_filled()) {
             m_gtd_scheduler->schedule_cancel(cmd.orderToken, today_4pm_est_utc());
         }
     }
 
-    
+
     void submit_order(Order& order) {
         match_order(order);
+
+        // Same reasoning as the OuchOrderCommand overload above — keep the
+        // two submit_order entry points consistent rather than letting this
+        // one (used by the benchmark harness and direct-Order-construction
+        // tests) silently diverge.
+        if (order.get_type() != ORDER_TYPE::CANCEL && !exists(order.get_id())) {
+            m_telemetry_policy.on_trace_complete(g_telemetry_arena[trace_index(order.m_telemetry_idx)]);
+        }
     }
 
     Price get_best_bid() const { return m_bid_book.get_best_price(); }

@@ -708,6 +708,8 @@ TEST_F(MatchingEngineTest, OutOfRangeWirePriceIsRejectedNotIndexed) {
     EXPECT_EQ(RejectReason::PRICE_OUT_OF_RANGE, events[0].reject_reason);
     EXPECT_EQ(Price(INVALID_PRICE), LOB.get_best_ask());
     EXPECT_EQ(Quantity(0), LOB.get_ask_quantity());
+    EXPECT_EQ(size_t(1), traces.size())
+        << "a rejected order has no later cancel/eviction to complete its trace — submit_order must do it directly";
 }
 
 TEST_F(MatchingEngineTest, MaxUint8WirePriceIsRejectedNotIndexed) {
@@ -886,6 +888,59 @@ TEST_F(MatchingEngineTest, PreflightCheckIgnoresOwnFirmAndCanPartiallyFill) {
     EXPECT_EQ(events.back().reject_reason, RejectReason::INSUFFICIENT_LIQUIDITY);
     EXPECT_EQ(Quantity(100), LOB.get_ask_quantity());
     EXPECT_EQ(Quantity(0), LOB.get_bid_quantity());
+}
+
+// =====================================================================
+// Telemetry trace completion for orders that never rest
+// =====================================================================
+// OrderTrace doesn't carry an identifying id once copied out of the arena
+// (see g_telemetry_arena), so these assert on traces.size() — how many
+// completions happened — rather than which specific order each entry
+// belongs to.
+
+TEST_F(MatchingEngineTest, TakerFullFillCompletesItsOwnTraceNotJustTheMakers) {
+    Order restingAsk(1, FIRM_A, SIDE::ASK, ORDER_TYPE::LIMIT, 50, 100);
+    LOB.submit_order(restingAsk);
+    EXPECT_EQ(size_t(0), traces.size()) << "a resting order's trace stays open until it's evicted";
+
+    Order takerBid(2, FIRM_B, SIDE::BID, ORDER_TYPE::LIMIT, 50, 100);
+    LOB.submit_order(takerBid);
+
+    // Before the fix this was 1 (only the maker's eviction completed a
+    // trace) — the taker crossed and fully filled without ever resting, so
+    // nothing else would ever have completed its own trace.
+    EXPECT_EQ(size_t(2), traces.size())
+        << "both the fully-filled maker (evicted) and the fully-filled taker (never rested) should complete a trace";
+}
+
+TEST_F(MatchingEngineTest, SelfTradePreventionRejectCompletesItsOwnTrace) {
+    Order restingAsk(1, FIRM_A, SIDE::ASK, ORDER_TYPE::LIMIT, 50, 100);
+    LOB.submit_order(restingAsk);
+    EXPECT_EQ(size_t(0), traces.size());
+
+    // Same firm as the resting order — self-trade prevention rejects this
+    // one rather than matching it. The resting order is untouched (stays
+    // resting, no completion for it), but the rejected aggressor's own
+    // trace has no later cancel/eviction to complete it either.
+    Order aggressorBid(2, FIRM_A, SIDE::BID, ORDER_TYPE::LIMIT, 50, 100);
+    LOB.submit_order(aggressorBid);
+
+    ASSERT_FALSE(events.empty());
+    EXPECT_EQ(events.back().reject_reason, RejectReason::SELF_TRADING_PREVENTION);
+    EXPECT_EQ(size_t(1), traces.size())
+        << "the rejected aggressor's trace should be completed even though it was never inserted";
+}
+
+TEST_F(MatchingEngineTest, ImmediateOrCancelWithNoLiquidityCompletesItsOwnTrace) {
+    // No resting liquidity at all — the IOC matches nothing and its entire
+    // quantity is canceled. IOC never rests by design, so before the fix
+    // nothing would ever have completed its trace.
+    Order iocBid(1, FIRM_A, SIDE::BID, ORDER_TYPE::IMMEDIATE_OR_CANCEL, 50, 100);
+    LOB.submit_order(iocBid);
+
+    ASSERT_FALSE(events.empty());
+    EXPECT_EQ(OrderEventType::CANCELED, events.back().type);
+    EXPECT_EQ(size_t(1), traces.size());
 }
 
 // =====================================================================
