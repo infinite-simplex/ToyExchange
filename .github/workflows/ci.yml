@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    # This project uses Linux-only APIs (epoll, mmap, multicast sockets,
+    # clock_gettime(CLOCK_TAI)), so it builds and runs here, not on
+    # windows-latest, even though local development happens via WSL.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # googletest and HdrHistogram_c are fetched at configure time via
+      # CMake FetchContent (see CMakeLists.txt) rather than installed as
+      # system packages. Caching build/_deps skips re-downloading them on
+      # every run; the cache key is invalidated automatically whenever the
+      # pinned versions in CMakeLists.txt change.
+      - name: Cache CMake FetchContent dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: ${{ runner.os }}-fetchcontent-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Run tests
+        working-directory: build
+        run: ctest --output-on-failure
