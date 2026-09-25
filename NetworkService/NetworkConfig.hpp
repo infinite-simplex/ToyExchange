@@ -1,22 +1,13 @@
 #pragma once
 #include <string>
-#include <vector>
-
-struct ClientSessionConfig {
-    std::string ipAddress;
-    uint16_t port;
-    std::string mpid; // Market Participant ID allowed on this connection
-};
 
 struct NetworkConfig {
     // Inbound OUCH configuration
-    std::string ouchListenIp = "0.0.0.0";
     uint16_t ouchListenPort = 10001;
 
     // Outbound ITCH configuration (UDP Multicast Group)
     std::string itchMulticastGroup = "233.0.1.1";
     uint16_t itchMulticastPort = 20001;
-    std::string itchInterfaceIp = "127.0.0.1"; // Local interface to bind multicast to
 
     // Internal order-replication channel: NetworkGateway multicasts each
     // sequenced SequencedInboundMessage<TCommand> here, and every
@@ -50,7 +41,4 @@ struct NetworkConfig {
     // (not multicast) since there is exactly one intended receiver.
     std::string performanceServiceIp = "127.0.0.1";
     uint16_t performanceServicePort = 40002;
-
-    // Pre-configured authorized traders
-    std::vector<ClientSessionConfig> authorizedClients;
 };
