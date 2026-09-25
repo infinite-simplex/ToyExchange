@@ -639,6 +639,37 @@ OuchOrderCommand make_enter_order_command(OrderId orderId, const char orderToken
     return cmd;
 }
 
+// side/firmId/orderType are deliberately left default — REPLACE_ORDER
+// doesn't carry them on the wire either (OrderBook::replace_order inherits
+// them from the existing order instead, same as real OUCH).
+OuchOrderCommand make_replace_order_command(OrderId existingOrderId, OrderId newOrderId,
+    const char newOrderToken[14], Quantity shares, Price price) {
+    OuchOrderCommand cmd{};
+    cmd.trace_id = static_cast<TraceId>(newOrderId); // this replace command's own trace
+    cmd.orderId = existingOrderId;
+    cmd.replacementOrderId = newOrderId;
+    cmd.price = price;
+    cmd.shares = shares;
+    cmd.stockLocate = 0;
+    std::memcpy(cmd.orderToken, newOrderToken, 14);
+    cmd.type = CommandType::REPLACE_ORDER;
+    return cmd;
+}
+
+// orderId is the id already resolved from orderToken (mirroring what
+// OuchProtocolHandler's CANCEL_ORDER case does via OrderTokenRegistry::resolve
+// before OrderBook ever sees the command) — pass INVALID_ORDER_ID to simulate
+// an unresolved/unknown token, same as the wire path's tolerant behavior.
+OuchOrderCommand make_cancel_order_command(TraceId traceId, OrderId orderId, const char orderToken[14]) {
+    OuchOrderCommand cmd{};
+    cmd.trace_id = traceId;
+    cmd.orderId = orderId;
+    cmd.stockLocate = 0;
+    std::memcpy(cmd.orderToken, orderToken, 14);
+    cmd.type = CommandType::CANCEL_ORDER;
+    return cmd;
+}
+
 } // namespace
 
 class GoodTillDayTest : public ::testing::Test {
@@ -770,6 +801,133 @@ TEST_F(MatchingEngineTest, ModifyChangesQueuePosition) {
 
     ASSERT_GE(fills.size(), size_t(1));
     EXPECT_EQ(2, fills[0].order_id); // Order 2 was prioritized over modified Order 1
+}
+
+// =====================================================================
+// REPLACE_ORDER
+// =====================================================================
+
+TEST_F(MatchingEngineTest, ReplaceStillRestsAtNewPriceAndQuantity) {
+    auto enter = make_enter_order_command(1, "REPL-ORIG0001", 'B', 100, 50, ORDER_TYPE::LIMIT);
+    LOB.submit_order(enter);
+    EXPECT_EQ(Price(50), LOB.get_best_bid());
+    EXPECT_EQ(Quantity(100), LOB.get_bid_quantity());
+
+    events.clear();
+
+    auto replace = make_replace_order_command(1, 2, "REPL-NEW00001", 75, 60);
+    LOB.submit_order(replace);
+
+    ASSERT_EQ(size_t(2), events.size());
+    EXPECT_EQ(OrderEventType::CANCELED, events[0].type);
+    EXPECT_EQ(OrderId(1), events[0].order_id);
+    EXPECT_EQ(OrderEventType::REPLACED, events[1].type)
+        << "a replacement that rests should be acked as REPLACED, not a redundant ACCEPTED";
+    EXPECT_EQ(OrderId(2), events[1].order_id);
+    EXPECT_EQ(Price(60), LOB.get_best_bid());
+    EXPECT_EQ(Quantity(75), LOB.get_bid_quantity());
+}
+
+TEST_F(MatchingEngineTest, ReplaceThatCrossesFullyFillsImmediately) {
+    // Distinct firms — make_enter_order_command doesn't set firmId (leaves
+    // it default 0), so without this override both orders would share firm
+    // 0 and self-trade prevention would reject the cross this test wants.
+    auto restingAsk = make_enter_order_command(1, "REPL-ASK00001", 'S', 50, 60, ORDER_TYPE::LIMIT);
+    restingAsk.firmId = 1;
+    LOB.submit_order(restingAsk);
+
+    auto restingBid = make_enter_order_command(2, "REPL-BID00001", 'B', 50, 40, ORDER_TYPE::LIMIT);
+    restingBid.firmId = 2;
+    LOB.submit_order(restingBid);
+    EXPECT_EQ(Price(40), LOB.get_best_bid());
+
+    events.clear();
+
+    // Repriced to cross the resting ask at 60 — should match immediately
+    // rather than rest, same as any order whose new price is marketable.
+    auto replace = make_replace_order_command(2, 3, "REPL-BID00002", 50, 60);
+    LOB.submit_order(replace);
+
+    bool sawExecuted = false;
+    for (const auto& ev : events) {
+        if (ev.type == OrderEventType::EXECUTED && ev.order_id == OrderId(3)) sawExecuted = true;
+        EXPECT_NE(OrderEventType::ACCEPTED, ev.type) << "a fully-filled replacement should never rest";
+    }
+    EXPECT_TRUE(sawExecuted);
+    EXPECT_EQ(Price(INVALID_PRICE), LOB.get_best_ask()) << "the resting ask should be fully consumed";
+}
+
+TEST_F(MatchingEngineTest, ReplaceWithUnknownExistingIdIsRejected) {
+    auto replace = make_replace_order_command(999, 1000, "REPL-GHOST001", 50, 40);
+    LOB.submit_order(replace);
+
+    ASSERT_EQ(size_t(1), events.size());
+    EXPECT_EQ(OrderEventType::REJECTED, events[0].type);
+    EXPECT_EQ(RejectReason::UNKNOWN_ORDER, events[0].reject_reason);
+    EXPECT_EQ(size_t(1), traces.size())
+        << "a rejected replace has no later cancel/eviction to complete its own trace";
+}
+
+TEST_F(MatchingEngineTest, ReplaceWithOutOfRangePriceIsRejected) {
+    auto enter = make_enter_order_command(1, "REPL-ORIG0002", 'B', 100, 50, ORDER_TYPE::LIMIT);
+    LOB.submit_order(enter);
+
+    events.clear();
+
+    auto replace = make_replace_order_command(1, 2, "REPL-NEW00002", 100, 255);
+    LOB.submit_order(replace);
+
+    ASSERT_EQ(size_t(1), events.size());
+    EXPECT_EQ(OrderEventType::REJECTED, events[0].type);
+    EXPECT_EQ(RejectReason::PRICE_OUT_OF_RANGE, events[0].reject_reason);
+    EXPECT_EQ(Price(50), LOB.get_best_bid()) << "the original order must be untouched by a rejected replace";
+    EXPECT_EQ(Quantity(100), LOB.get_bid_quantity());
+}
+
+// =====================================================================
+// CANCEL_ORDER (via OuchOrderCommand) — the CANCEL tests earlier in this
+// file exercise OrderBook::cancel semantics through the Order-based
+// submit_order(Order&) overload; these instead go through
+// submit_order(OuchOrderCommand&) with CommandType::CANCEL_ORDER, the actual
+// path a wire CANCEL_ORDER takes (create_order_from_command's CANCEL branch,
+// plus the cancel command's own trace completing separately from the
+// canceled order's trace, per submit_order's comment on that split).
+// =====================================================================
+
+TEST_F(MatchingEngineTest, CancelOrderCommandResolvesTokenAndCancelsRestingOrder) {
+    auto enter = make_enter_order_command(1, "CXL-ORIG00001", 'B', 100, 50, ORDER_TYPE::LIMIT);
+    enter.firmId = FIRM_A; // make_enter_order_command leaves firmId at its 0 default otherwise
+    LOB.submit_order(enter);
+    ASSERT_EQ(Price(50), LOB.get_best_bid());
+
+    events.clear();
+    traces.clear();
+
+    auto cancel = make_cancel_order_command(2, 1, "CXL-ORIG00001");
+    LOB.submit_order(cancel);
+
+    ASSERT_EQ(size_t(1), events.size());
+    EXPECT_EQ(OrderEventType::CANCELED, events[0].type);
+    EXPECT_EQ(OrderId(1), events[0].order_id);
+    EXPECT_EQ(FIRM_A, events[0].firm_id);
+    EXPECT_EQ(Price(50), events[0].price);
+    EXPECT_EQ(Quantity(100), events[0].quantity);
+    EXPECT_EQ(Price(INVALID_PRICE), LOB.get_best_bid());
+    EXPECT_EQ(Quantity(0), LOB.get_bid_quantity());
+    // Two completions: the target order's own trace (left open since it
+    // rested on ENTER, and only completes now on eviction) plus the cancel
+    // command's own trace (ingress -> engine_pop -> match_done for the
+    // cancel operation itself) — see submit_order(OuchOrderCommand&)'s
+    // comment on why CANCEL_ORDER completes both rather than just one.
+    EXPECT_EQ(size_t(2), traces.size());
+}
+
+TEST_F(MatchingEngineTest, CancelOrderCommandWithUnknownTokenIsASafeNoOp) {
+    auto cancel = make_cancel_order_command(1, OrderId(INVALID_ORDER_ID), "CXL-GHOST0001");
+    EXPECT_NO_THROW(LOB.submit_order(cancel));
+    EXPECT_TRUE(events.empty());
+    EXPECT_EQ(size_t(1), traces.size())
+        << "the cancel command's own trace still completes even when no target order was found";
 }
 
 // =====================================================================
@@ -1079,6 +1237,52 @@ std::vector<char> BuildOuchEnterOrderFrame(const char orderToken[14], char buySe
     return frame;
 }
 
+// Builds an OUCH REPLACE_ORDER ('U') frame matching OuchProtocolHandler's
+// expected wire layout: [2B BE payloadLen]['U'][14B existingToken]
+// [14B newToken][4B BE shares][4B BE price]. Two tokens, not one reused —
+// see OuchProtocolHandler.cpp's REPLACE_ORDER case.
+std::vector<char> BuildOuchReplaceOrderFrame(const char existingToken[14], const char newToken[14],
+    uint32_t shares, uint32_t price) {
+    constexpr size_t bodyLen = 14 + 14 + 4 + 4;
+    constexpr uint16_t payloadLen = static_cast<uint16_t>(1 + bodyLen);
+
+    std::vector<char> frame(2 + payloadLen);
+    size_t off = 0;
+    frame[off++] = static_cast<char>((payloadLen >> 8) & 0xFF);
+    frame[off++] = static_cast<char>(payloadLen & 0xFF);
+    frame[off++] = 'U';
+    std::memcpy(frame.data() + off, existingToken, 14); off += 14;
+    std::memcpy(frame.data() + off, newToken, 14); off += 14;
+    frame[off++] = static_cast<char>((shares >> 24) & 0xFF);
+    frame[off++] = static_cast<char>((shares >> 16) & 0xFF);
+    frame[off++] = static_cast<char>((shares >> 8) & 0xFF);
+    frame[off++] = static_cast<char>(shares & 0xFF);
+    frame[off++] = static_cast<char>((price >> 24) & 0xFF);
+    frame[off++] = static_cast<char>((price >> 16) & 0xFF);
+    frame[off++] = static_cast<char>((price >> 8) & 0xFF);
+    frame[off++] = static_cast<char>(price & 0xFF);
+    return frame;
+}
+
+// Builds an OUCH CANCEL_ORDER ('X') frame matching OuchProtocolHandler's
+// expected wire layout: [2B BE payloadLen]['X'][14B orderToken][4B BE shares].
+std::vector<char> BuildOuchCancelOrderFrame(const char orderToken[14], uint32_t shares) {
+    constexpr size_t bodyLen = 14 + 4;
+    constexpr uint16_t payloadLen = static_cast<uint16_t>(1 + bodyLen);
+
+    std::vector<char> frame(2 + payloadLen);
+    size_t off = 0;
+    frame[off++] = static_cast<char>((payloadLen >> 8) & 0xFF);
+    frame[off++] = static_cast<char>(payloadLen & 0xFF);
+    frame[off++] = 'X';
+    std::memcpy(frame.data() + off, orderToken, 14); off += 14;
+    frame[off++] = static_cast<char>((shares >> 24) & 0xFF);
+    frame[off++] = static_cast<char>((shares >> 16) & 0xFF);
+    frame[off++] = static_cast<char>((shares >> 8) & 0xFF);
+    frame[off++] = static_cast<char>(shares & 0xFF);
+    return frame;
+}
+
 // Busy-polls try_pop until an item is available or the timeout elapses.
 // Returns false (rather than hanging) if nothing arrives in time.
 template <typename TCommand, size_t Capacity>
@@ -1142,6 +1346,167 @@ TEST(NetworkIngressPipelineTest, GatewayToReceiverDeliversParsedOrderOverLoopbac
     EXPECT_EQ(expectedStockLocate, received.stockLocate);
     EXPECT_EQ(FirmId(7), received.firmId);
     EXPECT_EQ(0, std::memcmp(orderToken, received.orderToken, 14));
+
+    receiver.stop();
+    gateway.stop();
+}
+
+TEST(NetworkIngressPipelineTest, ReplaceOrderResolvesExistingIdAndMintsNewOne) {
+    SymbolRegistry registry;
+    registry.registerSymbol("TEST");
+    OrderTokenRegistry orderTokenRegistry;
+    OuchProtocolHandler handler(registry, orderTokenRegistry);
+
+    NetworkConfig config;
+    config.ouchListenPort = 15106;
+    config.multicastIp = "239.255.0.6";
+    config.multicastPort = 25106;
+
+    NetworkGateway<OuchProtocolHandler, OuchOrderCommand> gateway(
+        handler, config, "/tmp/eceo_test_seq_store_replace.dat", 1024);
+    gateway.start();
+
+    SPSCQueue<OuchOrderCommand> inboundQueue;
+    MulticastIngressReceiver<OuchOrderCommand> receiver(inboundQueue, config);
+    receiver.start();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    auto sendFrame = [&](const std::vector<char>& frame) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in serverAddr{};
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_port = htons(config.ouchListenPort);
+        inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
+        ASSERT_EQ(0, connect(fd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
+        ASSERT_EQ(static_cast<ssize_t>(frame.size()), send(fd, frame.data(), frame.size(), 0));
+        close(fd);
+    };
+
+    const char symbol[8] = { 'T', 'E', 'S', 'T', ' ', ' ', ' ', ' ' };
+    const char existingToken[14] = "REPLACE-OLD01";
+    const char newToken[14] = "REPLACE-NEW01";
+
+    sendFrame(BuildOuchEnterOrderFrame(existingToken, 'B', 50, symbol, 40));
+
+    OuchOrderCommand entered{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, entered)) << "ENTER_ORDER never arrived";
+    ASSERT_EQ(CommandType::ENTER_ORDER, entered.type);
+
+    sendFrame(BuildOuchReplaceOrderFrame(existingToken, newToken, 75, 45));
+
+    OuchOrderCommand replaced{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, replaced)) << "REPLACE_ORDER never arrived";
+
+    EXPECT_EQ(CommandType::REPLACE_ORDER, replaced.type);
+    EXPECT_EQ(entered.orderId, replaced.orderId)
+        << "the existing token should resolve to the id ENTER_ORDER was assigned";
+    EXPECT_NE(entered.orderId, replaced.replacementOrderId)
+        << "the replacement must get a distinct id, not reuse the original's";
+    EXPECT_NE(OrderId(INVALID_ORDER_ID), replaced.replacementOrderId);
+    EXPECT_EQ(0, std::memcmp(newToken, replaced.orderToken, 14))
+        << "orderToken should carry the NEW token, not the existing one";
+    EXPECT_EQ(Quantity(75), replaced.shares);
+    EXPECT_EQ(Price(45), replaced.price);
+
+    receiver.stop();
+    gateway.stop();
+}
+
+TEST(NetworkIngressPipelineTest, CancelOrderResolvesExistingTokenToId) {
+    SymbolRegistry registry;
+    registry.registerSymbol("TEST");
+    OrderTokenRegistry orderTokenRegistry;
+    OuchProtocolHandler handler(registry, orderTokenRegistry);
+
+    NetworkConfig config;
+    config.ouchListenPort = 15107;
+    config.multicastIp = "239.255.0.7";
+    config.multicastPort = 25107;
+
+    NetworkGateway<OuchProtocolHandler, OuchOrderCommand> gateway(
+        handler, config, "/tmp/eceo_test_seq_store_cancel.dat", 1024);
+    gateway.start();
+
+    SPSCQueue<OuchOrderCommand> inboundQueue;
+    MulticastIngressReceiver<OuchOrderCommand> receiver(inboundQueue, config);
+    receiver.start();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    auto sendFrame = [&](const std::vector<char>& frame) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in serverAddr{};
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_port = htons(config.ouchListenPort);
+        inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
+        ASSERT_EQ(0, connect(fd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
+        ASSERT_EQ(static_cast<ssize_t>(frame.size()), send(fd, frame.data(), frame.size(), 0));
+        close(fd);
+    };
+
+    const char symbol[8] = { 'T', 'E', 'S', 'T', ' ', ' ', ' ', ' ' };
+    const char orderToken[14] = "CANCEL-TOK001";
+
+    sendFrame(BuildOuchEnterOrderFrame(orderToken, 'B', 50, symbol, 40));
+
+    OuchOrderCommand entered{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, entered)) << "ENTER_ORDER never arrived";
+    ASSERT_EQ(CommandType::ENTER_ORDER, entered.type);
+
+    sendFrame(BuildOuchCancelOrderFrame(orderToken, 50));
+
+    OuchOrderCommand canceled{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, canceled)) << "CANCEL_ORDER never arrived";
+
+    EXPECT_EQ(CommandType::CANCEL_ORDER, canceled.type);
+    EXPECT_EQ(entered.orderId, canceled.orderId)
+        << "the token should resolve to the id ENTER_ORDER was assigned, same as CANCEL/REPLACE both rely on";
+    EXPECT_EQ(0, std::memcmp(orderToken, canceled.orderToken, 14));
+
+    receiver.stop();
+    gateway.stop();
+}
+
+TEST(NetworkIngressPipelineTest, CancelOrderWithUnknownTokenResolvesToInvalidOrderId) {
+    SymbolRegistry registry;
+    registry.registerSymbol("TEST");
+    OrderTokenRegistry orderTokenRegistry;
+    OuchProtocolHandler handler(registry, orderTokenRegistry);
+
+    NetworkConfig config;
+    config.ouchListenPort = 15108;
+    config.multicastIp = "239.255.0.8";
+    config.multicastPort = 25108;
+
+    NetworkGateway<OuchProtocolHandler, OuchOrderCommand> gateway(
+        handler, config, "/tmp/eceo_test_seq_store_cancel_unknown.dat", 1024);
+    gateway.start();
+
+    SPSCQueue<OuchOrderCommand> inboundQueue;
+    MulticastIngressReceiver<OuchOrderCommand> receiver(inboundQueue, config);
+    receiver.start();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(config.ouchListenPort);
+    inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
+    ASSERT_EQ(0, connect(fd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
+
+    const char unknownToken[14] = "NEVER-SENT001";
+    auto frame = BuildOuchCancelOrderFrame(unknownToken, 0);
+    ASSERT_EQ(static_cast<ssize_t>(frame.size()), send(fd, frame.data(), frame.size(), 0));
+    close(fd);
+
+    OuchOrderCommand canceled{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, canceled)) << "CANCEL_ORDER never arrived";
+
+    EXPECT_EQ(CommandType::CANCEL_ORDER, canceled.type);
+    EXPECT_EQ(OrderId(INVALID_ORDER_ID), canceled.orderId)
+        << "an unresolvable token should not stall the frame; OrderBook rejects it downstream instead";
 
     receiver.stop();
     gateway.stop();

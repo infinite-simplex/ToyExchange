@@ -172,7 +172,7 @@ public:
     }
 
     
-    void insert_order(Order& order) {
+    void insert_order(Order& order, OrderEventType eventType = OrderEventType::ACCEPTED) {
         Price p = order.get_price();
         auto& priceLevel = m_price_levels[p];
 
@@ -204,7 +204,7 @@ public:
 
         (*m_global_lookup)[order.get_id()] = &pooled_order;
         m_policy.on_order_event(OrderEvent{
-            .type{OrderEventType::ACCEPTED},
+            .type{eventType},
             .timestamp{get_synced_time_ns()},
             .sequence_number{m_next_sequence_number++},
             .order_id{order.get_id()},
@@ -416,10 +416,18 @@ public:
 
 
     void submit_order(OuchOrderCommand& cmd) {
+        // REPLACE_ORDER needs fundamentally different handling than "build
+        // an Order and dispatch on its type" — it must look up the existing
+        // order to inherit side/firm/type, so it gets its own path entirely.
+        if (cmd.type == CommandType::REPLACE_ORDER) {
+            replace_order(cmd);
+            return;
+        }
+
         // CANCEL_ORDER carries no meaningful price (OuchProtocolHandler zeroes
-        // it); only ENTER/REPLACE prices need to be within the book's range,
-        // since m_price_levels is indexed directly by Price with no further
-        // bounds check.
+        // it); only ENTER prices need to be within the book's range (REPLACE's
+        // own price check happens inside replace_order), since m_price_levels
+        // is indexed directly by Price with no further bounds check.
         if (cmd.type != CommandType::CANCEL_ORDER && cmd.price > WORST_ASK) {
             m_telemetry_policy.on_order_event(OrderEvent{
                 .type{OrderEventType::REJECTED},
@@ -513,6 +521,77 @@ private:
         return order;
     }
 
+    // A replace can change price/quantity but not the economic identity of
+    // an order — side/firm/type are inherited from whatever's being
+    // replaced, same as real OUCH. cmd.orderId is the EXISTING order (see
+    // OuchOrderCommand's comment); cmd.replacementOrderId/cmd.orderToken
+    // are the new order that results if this succeeds.
+    void replace_order(OuchOrderCommand& cmd) {
+        Order* existing = (cmd.orderId < MAX_GLOBAL_ORDERS) ? m_resting_orders[cmd.orderId] : nullptr;
+
+        if (existing == nullptr) {
+            m_telemetry_policy.on_order_event(OrderEvent{
+                .type{OrderEventType::REJECTED},
+                .timestamp{get_synced_time_ns()},
+                .sequence_number{m_next_sequence_number++},
+                .order_id{cmd.orderId},
+                .firm_id{0},
+                .session_id{cmd.sessionId},
+                .side{SIDE::NO_SIDE},
+                .price{cmd.price},
+                .quantity{cmd.shares},
+                .leaves_quantity{0},
+                .match_id{0},
+                .reject_reason{RejectReason::UNKNOWN_ORDER}
+                });
+            m_telemetry_policy.on_trace_complete(g_telemetry_arena[trace_index(cmd.trace_id)]);
+            return;
+        }
+
+        // Same bound ENTER_ORDER's own price check uses — m_price_levels is
+        // indexed directly by Price with no further bounds check.
+        if (cmd.price > WORST_ASK) {
+            m_telemetry_policy.on_order_event(OrderEvent{
+                .type{OrderEventType::REJECTED},
+                .timestamp{get_synced_time_ns()},
+                .sequence_number{m_next_sequence_number++},
+                .order_id{cmd.orderId},
+                .firm_id{existing->get_firm_id()},
+                .session_id{cmd.sessionId},
+                .side{existing->get_side()},
+                .price{cmd.price},
+                .quantity{cmd.shares},
+                .leaves_quantity{0},
+                .match_id{0},
+                .reject_reason{RejectReason::PRICE_OUT_OF_RANGE}
+                });
+            m_telemetry_policy.on_trace_complete(g_telemetry_arena[trace_index(cmd.trace_id)]);
+            return;
+        }
+
+        // Capture before cancel() — it frees the pool slot existing points
+        // to, so the pointer would dangle afterward.
+        SIDE side = existing->get_side();
+        FirmId firm = existing->get_firm_id();
+        ORDER_TYPE type = existing->get_type();
+
+        cancel(cmd.orderId); // evicts + completes the existing order's own trace via cancel_order
+
+        Order replacement(cmd.replacementOrderId, firm, side, type, cmd.price, cmd.shares);
+        replacement.m_telemetry_idx = cmd.trace_id;
+        replacement.m_session_id = cmd.sessionId;
+
+        limit(replacement, OrderEventType::REPLACED);
+
+        // Only LIMIT/GTC/GTD/MODIFY orders can ever be found via
+        // m_resting_orders in the first place (IOC/MARKET/FOK never rest),
+        // so limit() — not the full match_order() type dispatch — is always
+        // the right path for whatever type was inherited above.
+        if (!exists(replacement.get_id())) {
+            m_telemetry_policy.on_trace_complete(g_telemetry_arena[trace_index(cmd.trace_id)]);
+        }
+    }
+
     void match_order(Order& order) {
         if (order.get_type() == ORDER_TYPE::CANCEL) {
             cancel(order.get_id());
@@ -598,14 +677,17 @@ private:
         }
     }
         
-    void limit(Order& order) {
+    // eventType is what gets emitted if the order ends up resting — ACCEPTED
+    // for a normal new order, REPLACED for a replacement (see replace_order)
+    // so it doesn't also get a redundant ACCEPTED from insert_order.
+    void limit(Order& order, OrderEventType eventType = OrderEventType::ACCEPTED) {
         if (order.get_side() == SIDE::BID && m_ask_book.get_best_price() == INVALID_PRICE) {
-            m_bid_book.insert_order(order);
+            m_bid_book.insert_order(order, eventType);
             return;
         }
 
         if (order.get_side() == SIDE::ASK && m_bid_book.get_best_price() == INVALID_PRICE) {
-            m_ask_book.insert_order(order);
+            m_ask_book.insert_order(order, eventType);
             return;
         }
 
@@ -621,10 +703,10 @@ private:
 
         if (!order.is_filled()) {
             if (order.get_side() == SIDE::BID) {
-                m_bid_book.insert_order(order);
+                m_bid_book.insert_order(order, eventType);
             }
             else {
-                m_ask_book.insert_order(order);
+                m_ask_book.insert_order(order, eventType);
             }
         }
     }

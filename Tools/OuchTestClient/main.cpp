@@ -55,6 +55,51 @@ std::vector<char> BuildOuchEnterOrderFrame(const char orderToken[14], char buySe
     return frame;
 }
 
+// [2B BE payloadLen]['U'][14B existingToken][14B newToken][4B BE shares][4B BE price]
+// Matches OuchProtocolHandler.cpp's REPLACE_ORDER case: two tokens (the
+// order being replaced, and the new one identifying the result), not one
+// token reused — a token identifies one specific order instance.
+std::vector<char> BuildOuchReplaceOrderFrame(const char existingToken[14], const char newToken[14],
+    uint32_t shares, uint32_t price) {
+    constexpr size_t bodyLen = 14 + 14 + 4 + 4;
+    constexpr uint16_t payloadLen = static_cast<uint16_t>(1 + bodyLen);
+
+    std::vector<char> frame(2 + payloadLen);
+    size_t off = 0;
+    frame[off++] = static_cast<char>((payloadLen >> 8) & 0xFF);
+    frame[off++] = static_cast<char>(payloadLen & 0xFF);
+    frame[off++] = 'U';
+    std::memcpy(frame.data() + off, existingToken, 14); off += 14;
+    std::memcpy(frame.data() + off, newToken, 14); off += 14;
+    frame[off++] = static_cast<char>((shares >> 24) & 0xFF);
+    frame[off++] = static_cast<char>((shares >> 16) & 0xFF);
+    frame[off++] = static_cast<char>((shares >> 8) & 0xFF);
+    frame[off++] = static_cast<char>(shares & 0xFF);
+    frame[off++] = static_cast<char>((price >> 24) & 0xFF);
+    frame[off++] = static_cast<char>((price >> 16) & 0xFF);
+    frame[off++] = static_cast<char>((price >> 8) & 0xFF);
+    frame[off++] = static_cast<char>(price & 0xFF);
+    return frame;
+}
+
+// [2B BE payloadLen]['X'][14B token][4B BE shares]
+std::vector<char> BuildOuchCancelOrderFrame(const char orderToken[14], uint32_t shares) {
+    constexpr size_t bodyLen = 14 + 4;
+    constexpr uint16_t payloadLen = static_cast<uint16_t>(1 + bodyLen);
+
+    std::vector<char> frame(2 + payloadLen);
+    size_t off = 0;
+    frame[off++] = static_cast<char>((payloadLen >> 8) & 0xFF);
+    frame[off++] = static_cast<char>(payloadLen & 0xFF);
+    frame[off++] = 'X';
+    std::memcpy(frame.data() + off, orderToken, 14); off += 14;
+    frame[off++] = static_cast<char>((shares >> 24) & 0xFF);
+    frame[off++] = static_cast<char>((shares >> 16) & 0xFF);
+    frame[off++] = static_cast<char>((shares >> 8) & 0xFF);
+    frame[off++] = static_cast<char>(shares & 0xFF);
+    return frame;
+}
+
 void PadSymbol(char out[8], const std::string& symbol) {
     std::memset(out, ' ', 8);
     std::memcpy(out, symbol.data(), std::min<size_t>(symbol.size(), 8));
@@ -164,7 +209,7 @@ void PrintUsage() {
         "  --host <ip>            default 127.0.0.1\n"
         "  --port <port>          default 10001 (NetworkConfig::ouchListenPort)\n"
         "  --symbol <name>        default TEST, space-padded/truncated to 8 bytes\n"
-        "  --side B|S             required\n"
+        "  --side B|S             required for a new order (not for --replace-token)\n"
         "  --price <0-255>        required (Price is uint8_t on the exchange side)\n"
         "  --qty <shares>         required\n"
         "  --order-type <type>    LIMIT (default) | IOC | FOK | GTC | GTD | MARKET\n"
@@ -172,7 +217,19 @@ void PrintUsage() {
         "                         orders sharing a firm id that would otherwise\n"
         "                         cross each other — use different --firm-id\n"
         "                         values across invocations to let them match.\n"
-        "  --token <text>         default: auto-generated, unique per order sent\n"
+        "  --token <text>         default: auto-generated, unique per order sent.\n"
+        "                         With --replace-token, this is the NEW token.\n"
+        "  --replace-token <text> send a REPLACE_ORDER instead of ENTER_ORDER,\n"
+        "                         replacing the order currently identified by\n"
+        "                         this existing token with one at --price/--qty\n"
+        "                         (identified afterward by --token, or an\n"
+        "                         auto-generated one if --token isn't given).\n"
+        "                         Ignores --side/--order-type/--firm-id/--count,\n"
+        "                         which don't apply to a replace.\n"
+        "  --cancel-token <text>  send a CANCEL_ORDER instead of ENTER_ORDER,\n"
+        "                         canceling the order currently identified by\n"
+        "                         this token. Ignores --side/--price/--order-type/\n"
+        "                         --firm-id/--count/--replace-token.\n"
         "  --count <n>            send n orders over one connection, default 1\n"
         "  --interval-ms <ms>     delay between sends when --count > 1, default 0\n"
         "  --listen-ms <ms>       after sending, keep the connection open and\n"
@@ -192,6 +249,8 @@ int main(int argc, char** argv) {
     ORDER_TYPE orderType = ORDER_TYPE::LIMIT;
     uint32_t firmId = 0;
     std::string tokenOverride;
+    std::string replaceToken;
+    std::string cancelToken;
     int count = 1;
     int intervalMs = 0;
     int listenMs = 0;
@@ -212,6 +271,8 @@ int main(int argc, char** argv) {
         else if (arg == "--order-type") orderType = ParseOrderType(next());
         else if (arg == "--firm-id") firmId = static_cast<uint32_t>(std::stoul(next()));
         else if (arg == "--token") tokenOverride = next();
+        else if (arg == "--replace-token") replaceToken = next();
+        else if (arg == "--cancel-token") cancelToken = next();
         else if (arg == "--count") count = std::stoi(next());
         else if (arg == "--interval-ms") intervalMs = std::stoi(next());
         else if (arg == "--listen-ms") listenMs = std::stoi(next());
@@ -223,9 +284,25 @@ int main(int argc, char** argv) {
         }
     }
 
-    if ((side != 'B' && side != 'S') || price < 0 || price > 255 || qty <= 0) {
+    bool isReplace = !replaceToken.empty();
+    bool isCancel = !cancelToken.empty();
+    if (isReplace && isCancel) {
+        std::cerr << "--replace-token and --cancel-token are mutually exclusive.\n";
+        return 1;
+    }
+    bool needsPriceAndSide = !isReplace && !isCancel;
+    if ((needsPriceAndSide && side != 'B' && side != 'S') || (!isCancel && (price < 0 || price > 255))
+        || (!isCancel && qty <= 0)) {
         std::cerr << "Missing/invalid required arguments.\n";
         PrintUsage();
+        return 1;
+    }
+    if (isReplace && replaceToken.size() > 14) {
+        std::cerr << "--replace-token must be at most 14 bytes.\n";
+        return 1;
+    }
+    if (isCancel && cancelToken.size() > 14) {
+        std::cerr << "--cancel-token must be at most 14 bytes.\n";
         return 1;
     }
 
@@ -248,30 +325,72 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    for (int i = 0; i < count; ++i) {
-        char token[14];
-        if (!tokenOverride.empty() && count == 1) {
-            std::memset(token, ' ', 14);
-            std::memcpy(token, tokenOverride.data(), std::min<size_t>(tokenOverride.size(), 14));
+    if (isReplace) {
+        char existingTokenBuf[14];
+        std::memset(existingTokenBuf, ' ', 14);
+        std::memcpy(existingTokenBuf, replaceToken.data(), replaceToken.size());
+
+        char newToken[14];
+        if (!tokenOverride.empty()) {
+            std::memset(newToken, ' ', 14);
+            std::memcpy(newToken, tokenOverride.data(), std::min<size_t>(tokenOverride.size(), 14));
         } else {
-            MakeToken(token, static_cast<uint32_t>(std::chrono::steady_clock::now().time_since_epoch().count() ^ i));
+            MakeToken(newToken, static_cast<uint32_t>(std::chrono::steady_clock::now().time_since_epoch().count()));
         }
 
-        auto frame = BuildOuchEnterOrderFrame(token, side, static_cast<uint32_t>(qty), symbol,
-            static_cast<uint32_t>(price), orderType, firmId);
+        auto frame = BuildOuchReplaceOrderFrame(existingTokenBuf, newToken,
+            static_cast<uint32_t>(qty), static_cast<uint32_t>(price));
 
         ssize_t sent = send(sock, frame.data(), frame.size(), 0);
         if (sent != static_cast<ssize_t>(frame.size())) {
-            std::cerr << "Failed to send frame " << i << "\n";
+            std::cerr << "Failed to send REPLACE_ORDER frame\n";
             close(sock);
             return 1;
         }
 
-        std::cout << "Sent ENTER_ORDER: side=" << side << " price=" << price
-                  << " qty=" << qty << " symbol=" << symbolStr << " firm_id=" << firmId << "\n";
+        std::cout << "Sent REPLACE_ORDER: existing_token=" << replaceToken
+                  << " price=" << price << " qty=" << qty << "\n";
+    } else if (isCancel) {
+        char cancelTokenBuf[14];
+        std::memset(cancelTokenBuf, ' ', 14);
+        std::memcpy(cancelTokenBuf, cancelToken.data(), cancelToken.size());
 
-        if (i + 1 < count && intervalMs > 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
+        auto frame = BuildOuchCancelOrderFrame(cancelTokenBuf, qty > 0 ? static_cast<uint32_t>(qty) : 0);
+
+        ssize_t sent = send(sock, frame.data(), frame.size(), 0);
+        if (sent != static_cast<ssize_t>(frame.size())) {
+            std::cerr << "Failed to send CANCEL_ORDER frame\n";
+            close(sock);
+            return 1;
+        }
+
+        std::cout << "Sent CANCEL_ORDER: token=" << cancelToken << "\n";
+    } else {
+        for (int i = 0; i < count; ++i) {
+            char token[14];
+            if (!tokenOverride.empty() && count == 1) {
+                std::memset(token, ' ', 14);
+                std::memcpy(token, tokenOverride.data(), std::min<size_t>(tokenOverride.size(), 14));
+            } else {
+                MakeToken(token, static_cast<uint32_t>(std::chrono::steady_clock::now().time_since_epoch().count() ^ i));
+            }
+
+            auto frame = BuildOuchEnterOrderFrame(token, side, static_cast<uint32_t>(qty), symbol,
+                static_cast<uint32_t>(price), orderType, firmId);
+
+            ssize_t sent = send(sock, frame.data(), frame.size(), 0);
+            if (sent != static_cast<ssize_t>(frame.size())) {
+                std::cerr << "Failed to send frame " << i << "\n";
+                close(sock);
+                return 1;
+            }
+
+            std::cout << "Sent ENTER_ORDER: side=" << side << " price=" << price
+                      << " qty=" << qty << " symbol=" << symbolStr << " firm_id=" << firmId << "\n";
+
+            if (i + 1 < count && intervalMs > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
+            }
         }
     }
 

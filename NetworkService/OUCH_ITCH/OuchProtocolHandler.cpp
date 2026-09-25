@@ -131,14 +131,22 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
     }
 
     case 'U': { // REPLACE_ORDER
-        constexpr size_t EXPECTED_BODY_LEN = 14 + 4 + 4;
+        // Two tokens, matching real OUCH: the existing order's token (to
+        // find what's being replaced) and a new token (identifying the
+        // resulting order going forward) — not the same token reused,
+        // since a token is meant to identify one specific order instance.
+        constexpr size_t EXPECTED_BODY_LEN = 14 + 14 + 4 + 4;
         if (bodyLen != EXPECTED_BODY_LEN) {
             return 0; // FLAG: malformed — see NOTE above
         }
 
         size_t off = 0;
 
-        std::memcpy(outCmd.orderToken, body + off, 14);
+        char existingOrderToken[14];
+        std::memcpy(existingOrderToken, body + off, 14);
+        off += 14;
+
+        std::memcpy(outCmd.orderToken, body + off, 14); // the NEW token
         off += 14;
 
         outCmd.shares = readBE32(body + off);
@@ -146,6 +154,19 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
 
         outCmd.price = readBE32(body + off);
         off += 4;
+
+        // Not found (INVALID_ORDER_ID) is accepted, not rejected here — the
+        // same reasoning as CANCEL_ORDER: OrderBook rejects a replace that
+        // references an unknown order, this layer just resolves the token.
+        outCmd.orderId = m_orderTokenRegistry.resolve(existingOrderToken);
+
+        // Eagerly minted and registered, same as ENTER_ORDER, even though
+        // the replace might still be rejected by OrderBook (e.g. the
+        // existing order wasn't found) — harmless either way, since an id
+        // that was never actually inserted just safely no-ops on any later
+        // lookup, same tolerant pattern OrderTokenRegistry already documents.
+        outCmd.replacementOrderId = m_nextOrderId++;
+        m_orderTokenRegistry.insert(outCmd.orderToken, outCmd.replacementOrderId);
 
         outCmd.stockLocate = 0;
         outCmd.buySellIndicator = '\0';
