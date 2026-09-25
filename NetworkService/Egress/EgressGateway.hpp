@@ -14,22 +14,17 @@
 #include <unistd.h>
 
 // Runs inside NetworkServiceApp: joins the internal egress multicast channel
-// (see NetworkConfig::egressMulticastIp/Port) that every MatchingServiceApp
-// replica's EgressPublisher writes to, and for each FencedMessage<TEvent>
-// received:
-//   - drops it if its epoch is stale (see ReplicaArbiter — this is what
-//     actually makes a failed-over-away-from replica's late traffic
-//     harmless, rather than requiring it to notice its own demotion)
-//   - prints it to console (stand-in for a real market-data/ack consumer
-//     while there's no client that can fully decode the wire frame yet)
-//   - sends a private OUCH-style ack back over the originating client's own
-//     TCP connection, via TGateway::sendToSession (a no-op if that client
-//     has since disconnected)
-//   - broadcasts the same encoded bytes to the public ITCH multicast group
+// every MatchingServiceApp replica's EgressPublisher writes to, and for each
+// FencedMessage<TEvent> received: drops it if its epoch is stale (see
+// ReplicaArbiter — this is what makes a failed-over replica's late traffic
+// harmless without it needing to notice its own demotion), prints it to
+// console (stand-in for a real market-data consumer), sends a private
+// OUCH-style ack back over the originating client's own TCP connection via
+// TGateway::sendToSession (a no-op if that client has since disconnected),
+// and broadcasts the same encoded bytes to the public ITCH multicast group.
 //
-// TGateway is NetworkGateway<TProtocolHandler, TCommand> — templated here
-// rather than named directly so this header doesn't need to know either of
-// NetworkGateway's own template parameters.
+// TGateway is NetworkGateway<TProtocolHandler, TCommand> — templated here so
+// this header doesn't need to know either of its own template parameters.
 template <typename TGateway, typename TEvent>
 class EgressGateway {
 public:

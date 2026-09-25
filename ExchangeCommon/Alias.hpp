@@ -4,11 +4,10 @@
 
 using Price = std::uint8_t;
 // This exchange's whole price domain: event-contract cents, 0-100 inclusive.
-// Lives here (not in MatchingService/OrderBook.hpp, where these used to be
-// #define'd locally) because OuchProtocolHandler (NetworkService) also needs
-// them to bounds-check a real OUCH price on ingress, and NetworkService does
-// not — and should not — link against MatchingService. OrderBook.hpp's own
-// m_price_levels array is indexed directly by Price using these same bounds.
+// Shared here since OuchProtocolHandler (NetworkService) needs the same
+// bounds to validate a real OUCH price on ingress without NetworkService
+// linking MatchingService; OrderBook.hpp's m_price_levels array is indexed
+// directly by Price using these same bounds.
 constexpr Price WORST_BID = 0;
 constexpr Price WORST_ASK = 100;
 using Quantity = std::int32_t;
@@ -29,9 +28,8 @@ constexpr TraceId INVALID_TRACE_ID = 0xFFFFFFFFu; // trace_id 0 is a real, assig
 // (typically boot time), so it has exactly the same cross-machine
 // incomparability problem as a raw TSC value — an OrderEvent stamped on one
 // machine and read/compared on another needs a real, synchronized wall-clock
-// reading. (std::chrono::tai_clock, the typed C++20 equivalent, is declared
-// but not implemented on this toolchain — confirmed via a direct compile
-// check against libstdc++ 11 — hence the plain integer instead.)
+// reading. (std::chrono::tai_clock, the typed C++20 equivalent, isn't
+// implemented on this toolchain, hence the plain integer.)
 using Timestamp = std::uint64_t;
 
 // Opaque per-connection correlation tag, minted once by NetworkGateway when a

@@ -31,7 +31,6 @@ public:
     void start() {
         if (m_running.load()) return;
 
-        // 1. Create UDP socket
         m_udpFd = socket(AF_INET, SOCK_DGRAM, 0);
 
         int opt = 1;
@@ -44,14 +43,12 @@ public:
         rxTimeout.tv_usec = 200'000; // 200ms
         setsockopt(m_udpFd, SOL_SOCKET, SO_RCVTIMEO, &rxTimeout, sizeof(rxTimeout));
 
-        // 2. Bind to multicast port
         sockaddr_in bindAddr{};
         bindAddr.sin_family = AF_INET;
         bindAddr.sin_port = htons(m_config.multicastPort);
         bindAddr.sin_addr.s_addr = INADDR_ANY;
         bind(m_udpFd, (struct sockaddr*)&bindAddr, sizeof(bindAddr));
 
-        // 3. Join Multicast Group
         ip_mreq mreq{};
         inet_pton(AF_INET, m_config.multicastIp.c_str(), &mreq.imr_multiaddr);
         mreq.imr_interface.s_addr = INADDR_ANY;

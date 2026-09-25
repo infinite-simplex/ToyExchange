@@ -55,39 +55,28 @@ namespace {
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Real NASDAQ OUCH 4.2 wire structs, from OUCH.hpp — see that file for the
-// full field layout and spec citation. Frame layout on the wire:
-//   [2 bytes, BE] payloadLen  -- length of everything after this field;
-//                                equals sizeof() the matching OUCH.hpp
-//                                struct below (that struct's own
-//                                messageType field included)
-//   [1 byte]      msgType     -- 'O' = Enter, 'X' = Cancel, 'U' = Replace
-//   [payloadLen-1 bytes]      -- the rest of that same struct
-// The [2B len] framing itself is this project's own transport envelope
-// (real OUCH runs over SoupBinTCP, deliberately not implemented here) —
-// only what comes after it is byte-accurate to the real spec. Each case
-// below reinterpret_casts the region starting at the msgType byte directly
-// onto the corresponding #pragma pack(1) OUCH.hpp struct (msgType doubles
-// as that struct's own first field), then reads every multi-byte integer
-// field through the existing readBE16/readBE32 helpers — reinterpret_cast
-// recovers field layout, readBE* still handles the wire's big-endianness,
-// which this project's own machines don't share. Single-byte/char[N]
-// fields need no swap and are read directly off the cast struct.
+// Real NASDAQ OUCH 4.2 wire structs, from OUCH.hpp. Frame on the wire:
+//   [2B BE payloadLen][1B msgType]<rest of that OUCH.hpp struct>
+// payloadLen == sizeof() the matching struct (messageType byte included).
+// The [2B len] envelope is this project's own transport framing (real OUCH
+// runs over SoupBinTCP, not implemented here) — only what follows msgType
+// is byte-accurate to the real spec. Each case reinterpret_casts the region
+// starting at msgType onto the matching #pragma pack(1) struct, then reads
+// multi-byte fields through readBE16/readBE32 for the wire's big-endianness
+// (this project's own machines are little-endian); char/char[N] fields need
+// no swap.
 //
 // Error policy, split by whether a command can even be built from the bytes:
-//   - Structurally uninterpretable (wrong length for the given type, an
-//     unrecognized message type byte): the wire framing itself is broken,
-//     nothing downstream could make sense of it either. Returns
-//     PARSE_FATAL_ERROR; NetworkGateway closes the connection rather than
-//     stalling on bytes that will never parse.
+//   - Structurally uninterpretable (wrong length, unrecognized msgType):
+//     nothing downstream could parse it either. Returns PARSE_FATAL_ERROR;
+//     NetworkGateway closes the connection rather than stalling on bytes
+//     that will never parse.
 //   - Well-formed frame, invalid content (unknown symbol, price outside
-//     this exchange's [WORST_BID, WORST_ASK] range): the frame has the
-//     right shape, a real OuchOrderCommand can still be built from what's
-//     already parsed. Returns totalFrameLen with type = CommandType::INVALID,
-//     same as any other command — OrderBook rejects it through the normal
-//     pipeline, matching how CANCEL_ORDER's unknown-token case below is
-//     already "accepted, not rejected" at this layer rather than killing
-//     the session over a business-level miss.
+//     [WORST_BID, WORST_ASK]): a real OuchOrderCommand can still be built.
+//     Returns totalFrameLen with type = CommandType::INVALID and flows
+//     through the normal OrderBook reject pipeline — same as CANCEL_ORDER's
+//     unknown-token case below, which is accepted, not rejected, at this
+//     layer.
 // ---------------------------------------------------------------------------
 
 size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLen, OuchOrderCommand& outCmd) {
@@ -97,7 +86,7 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
         return 0; // not even enough to read the length field yet
     }
 
-    uint16_t payloadLen = readBE16(buf); // length of (msgType byte + rest of the OUCH.hpp struct)
+    uint16_t payloadLen = readBE16(buf);
     size_t totalFrameLen = LENGTH_FIELD_SIZE + payloadLen;
 
     if (availableLen < totalFrameLen) {
@@ -112,7 +101,7 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
     switch (msgType) {
     case 'O': { // ENTER_ORDER
         if (payloadLen != sizeof(OUCHEnterOrder)) {
-            return PARSE_FATAL_ERROR; // wrong length to be a real OUCHEnterOrder
+            return PARSE_FATAL_ERROR;
         }
         const OUCHEnterOrder* wire = reinterpret_cast<const OUCHEnterOrder*>(buf + LENGTH_FIELD_SIZE);
 
@@ -164,7 +153,7 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
 
     case 'X': { // CANCEL_ORDER
         if (payloadLen != sizeof(OUCHCancelOrder)) {
-            return PARSE_FATAL_ERROR; // wrong length to be a real OUCHCancelOrder
+            return PARSE_FATAL_ERROR;
         }
         const OUCHCancelOrder* wire = reinterpret_cast<const OUCHCancelOrder*>(buf + LENGTH_FIELD_SIZE);
 
@@ -186,7 +175,7 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
 
     case 'U': { // REPLACE_ORDER
         if (payloadLen != sizeof(OUCHReplaceOrder)) {
-            return PARSE_FATAL_ERROR; // wrong length to be a real OUCHReplaceOrder
+            return PARSE_FATAL_ERROR;
         }
         const OUCHReplaceOrder* wire = reinterpret_cast<const OUCHReplaceOrder*>(buf + LENGTH_FIELD_SIZE);
 
@@ -229,6 +218,6 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
     }
 
     default:
-        return PARSE_FATAL_ERROR; // no idea how to interpret the body at all
+        return PARSE_FATAL_ERROR;
     }
 }

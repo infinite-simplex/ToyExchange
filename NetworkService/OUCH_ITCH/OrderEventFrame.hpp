@@ -8,9 +8,10 @@
 // ack (unicast, over the originating client's TCP connection) and the public
 // ITCH broadcast (multicast) — see EgressGateway.hpp, which sends the exact
 // same bytes to both destinations. Mirrors the [2B BE len][1B type]<body>
-// style OuchProtocolHandler already uses for ingress, rather than the
-// byte-accurate (but much larger, and only partially populatable) structs in
-// OUCH.hpp/ITCH.hpp.
+// style OuchProtocolHandler uses for ingress, rather than real OUCH-style
+// wire structs — those describe NASDAQ's inbound format (see
+// OuchProtocolHandler.cpp), not what this project needs for its own egress
+// frame.
 //
 // Layout: [2B BE payloadLen][1B type][8B BE order_id][1B side]
 //         [1B price][4B BE quantity][4B BE leaves_quantity]

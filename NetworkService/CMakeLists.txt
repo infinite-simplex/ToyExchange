@@ -1,8 +1,7 @@
 # Gather all .cpp source files inside NetworkService and its subfolders
-# (Ingress/, Egress/, OUCH_ITCH/, GPU_PROT/), excluding main.cpp which
-# belongs to the standalone NetworkServiceApp executable only (kept out of
-# the library so linking it, e.g. from EngineTests, doesn't pull in a
-# second main()).
+# (Ingress/, Egress/, OUCH_ITCH/), excluding main.cpp which belongs to the
+# standalone NetworkServiceApp executable only (kept out of the library so
+# linking it, e.g. from EngineTests, doesn't pull in a second main()).
 file(GLOB_RECURSE NETWORK_SOURCES "*.cpp")
 list(REMOVE_ITEM NETWORK_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp")
 
@@ -18,7 +17,6 @@ target_include_directories(NetworkService PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/Ingress
     ${CMAKE_CURRENT_SOURCE_DIR}/Egress
     ${CMAKE_CURRENT_SOURCE_DIR}/OUCH_ITCH
-    ${CMAKE_CURRENT_SOURCE_DIR}/GPU_PROT
     ${CMAKE_CURRENT_SOURCE_DIR}/Arbitration
 )
 

@@ -13,19 +13,12 @@
 #include "SPSCProducerPolicy.hpp"
 #include "IGoodTillDayScheduler.hpp"
 #include "MarketHours.hpp"
-// get_synced_time_ns() is needed unconditionally now (every OrderEvent's
-// .timestamp uses it, not just an ENABLE_DETAILED_TELEMETRY build) — was
-// previously guarded behind that flag here, though SPSCProducerPolicy.hpp
-// already pulls Telemetry.hpp in transitively either way; made explicit
-// and unconditional rather than relying on that transitive include.
-#include "Telemetry.hpp"
-// WORST_ASK / WORST_BID now live in ExchangeCommon/Alias.hpp (pulled in
-// transitively via OuchOrderCommand.hpp above) — NetworkService's
-// OuchProtocolHandler needs the same bounds to validate a real OUCH price on
-// ingress, and moving them there avoids NetworkService linking MatchingService.
+#include "Telemetry.hpp" // every OrderEvent's .timestamp needs get_synced_time_ns()
+// WORST_ASK / WORST_BID live in ExchangeCommon/Alias.hpp (pulled in
+// transitively via OuchOrderCommand.hpp above) — shared with NetworkService's
+// ingress price validation, which must not link MatchingService.
 
-// Limit bounds to realistic limits or maintain full size via heap allocation
-static constexpr std::size_t MAX_GLOBAL_ORDERS = 10'000'000u; // Sized for runtime bounds
+static constexpr std::size_t MAX_GLOBAL_ORDERS = 10'000'000u;
 static constexpr std::size_t MAX_LEVELS = 101u; // [0, 100] inclusive
 static constexpr std::size_t BOOK_POOL_SIZE = 262'144u;
 
@@ -40,10 +33,8 @@ public:
 
 struct OrderBookBits {
     // 2 chunks of 64 bits = 128 bits total (perfectly fits 101 price levels)
-    // Replaced 'unsigned __int64' with standard portable 'uint64_t'
     std::array<uint64_t, 2> m_chunks{ 0, 0 };
 
-    // Sets a price level (0 to 100)
     void set(Price level) {
         m_chunks[level / 64] |= (1ULL << (level % 64));
     }
@@ -52,29 +43,25 @@ struct OrderBookBits {
         m_chunks[level / 64] &= ~(1ULL << (level % 64));
     }
 
-    // Hardware-accelerated: Find the first active price level
     Price find_first_level() const {
-        // Step 1: Scan the first 64 price levels (0-63)
         if (m_chunks[0] != 0) {
             // __builtin_ctzll finds the lowest set bit index (0 to 63)
             return static_cast<Price>(__builtin_ctzll(m_chunks[0]));
         }
 
-        // Step 2: Scan the remaining price levels (64-100)
         if (m_chunks[1] != 0) {
             auto index = __builtin_ctzll(m_chunks[1]);
             auto global_index = 64 + index;
             return static_cast<Price>((global_index < 101) ? global_index : INVALID_PRICE);
         }
 
-        return INVALID_PRICE; // No active levels found
+        return INVALID_PRICE;
     }
 
     Price find_last_level() const {
-        // Scan chunk 1 first (levels 64 - 100)
         if (m_chunks[1] != 0) {
-            // __builtin_clzll counts leading zeros from the MOST significant bit down.
-            // 63 minus leading zeros gives us the highest set bit index.
+            // __builtin_clzll counts leading zeros from the MOST significant bit down;
+            // 63 minus that gives the highest set bit index.
             auto index = 63 - __builtin_clzll(m_chunks[1]);
             auto global_index = 64 + index;
 
@@ -83,7 +70,6 @@ struct OrderBookBits {
             }
         }
 
-        // Scan chunk 0 next (levels 0 - 63)
         if (m_chunks[0] != 0) {
             auto index = 63 - __builtin_clzll(m_chunks[0]);
             return static_cast<Price>(index);
@@ -149,17 +135,13 @@ public:
 
     
     void match_order(Order& order) {
-        // 1. Single bit scan to find starting point
         Price p = get_best_price();
 
-        // 2. Linear step loop (Branch-predictor friendly)
         while (p <= 100 && order.get_remaining_quantity() > 0u && is_crossed(p, order.get_price())) {
-            // Process level p until empty OR order filled
             if (m_price_levels[p].get_resting_quantity() > 0) {
                 walk_price_level(p, m_price_levels[p], order);
             }
 
-            // If order still has quantity, move directly to the next adjacent price level
             if (order.get_remaining_quantity() == 0u) break;
 
             // Advance to next candidate price without invoking bitwise instructions
@@ -314,7 +296,7 @@ private:
             auto& topOrder = m_order_pool[curr];
             ++trace.resting_orders_touched;
             if (topOrder.get_firm_id() == order.get_firm_id()) {
-                //STP prevention, we cancel the aggressive order                
+                // STP: reject the aggressive (incoming) order, not the resting one
                 m_policy.on_order_event(OrderEvent{
                     .type{OrderEventType::REJECTED},
                     .timestamp{get_synced_time_ns()},
@@ -338,7 +320,7 @@ private:
                 takenFromBook += matchedQuantity;
                 m_quantity -= matchedQuantity;
                 priceLevel.m_resting_quantity -= matchedQuantity;
-                //create 2 trade execution events one for each participant, sharing one match_id
+                // Two trade execution events, one per participant, sharing one match_id
                 ExecutionId matchId = m_next_match_id++;
                 m_policy.on_order_event(create_trade_execution_event(topOrder, matchedQuantity, p, matchId));
                 m_policy.on_order_event(create_trade_execution_event(order, matchedQuantity, p, matchId));
@@ -388,7 +370,9 @@ private:
     std::array<PriceLevel, MAX_LEVELS> m_price_levels{};
     OrderBookBits m_active_prices_mask;
 
-    // Arena storage moved off stack onto heap via unique_ptr buffers
+    // Heap-allocated via unique_ptr — BOOK_POOL_SIZE (262,144) Order/OrderId
+    // entries would be too large a stack frame here, same reasoning
+    // OrderTokenRegistry.hpp uses for its own table.
     std::unique_ptr<Order[]> m_order_pool;
     std::unique_ptr<OrderId[]> m_free_pool;
     OrderId m_free_top{ BOOK_POOL_SIZE };
@@ -497,8 +481,7 @@ public:
 
         // Same reasoning as the OuchOrderCommand overload above — keep the
         // two submit_order entry points consistent rather than letting this
-        // one (used by the benchmark harness and direct-Order-construction
-        // tests) silently diverge.
+        // one silently diverge.
         if (order.get_type() != ORDER_TYPE::CANCEL && !exists(order.get_id())) {
             complete_trace(m_telemetry_policy, order.m_telemetry_idx);
         }
@@ -518,7 +501,6 @@ public:
     Quantity get_ask_quantity() const { return m_ask_book.get_resting_quantity(); }
 
 private:
-    // Heap-allocated lookup vector initialized at startup
     TelemetryPolicy& m_telemetry_policy;
     IGoodTillDayScheduler* m_gtd_scheduler{ nullptr };
     std::vector<Order*> m_resting_orders;
@@ -662,7 +644,9 @@ private:
     }
         
     void fill_or_kill(Order& order) {
-        //this doesn't satisfy STP
+        // dry_run_available_quantity ignores self-trade prevention, so this
+        // preflight check can pass more quantity than actually ends up
+        // filling once STP carves some of it back out below.
         if (order.get_side() == SIDE::BID && m_ask_book.dry_run_available_quantity(order, order.get_initial_quantity()) < order.get_initial_quantity()) {
             m_telemetry_policy.on_order_event(OrderEvent{
                 .type{OrderEventType::REJECTED},
