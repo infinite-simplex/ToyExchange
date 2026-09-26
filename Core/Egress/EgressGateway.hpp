@@ -1,7 +1,6 @@
 #pragma once
 #include "FencedMessage.hpp"
 #include "NetworkConfig.hpp"
-#include "OrderEventFrame.hpp"
 #include "ReplicaArbiter.hpp"
 
 #include <atomic>
@@ -18,14 +17,17 @@
 // FencedMessage<TEvent> received: drops it if its epoch is stale (see
 // ReplicaArbiter — this is what makes a failed-over replica's late traffic
 // harmless without it needing to notice its own demotion), prints it to
-// console (stand-in for a real market-data consumer), sends a private
-// OUCH-style ack back over the originating client's own TCP connection via
+// console (stand-in for a real market-data consumer), sends a private ack
+// back over the originating client's own TCP connection via
 // TGateway::sendToSession (a no-op if that client has since disconnected),
-// and broadcasts the same encoded bytes to the public ITCH multicast group.
+// and broadcasts the same encoded bytes to the public broadcast group.
 //
 // TGateway is NetworkGateway<TProtocolHandler, TCommand> — templated here so
 // this header doesn't need to know either of its own template parameters.
-template <typename TGateway, typename TEvent>
+// TEncoder converts a TEvent into wire bytes and formats it for the console
+// (static encode()/print() — see e.g. OuchEventEncoder in OrderEventFrame.hpp)
+// — this header has no knowledge of any specific product's event format.
+template <typename TGateway, typename TEvent, typename TEncoder>
 class EgressGateway {
 public:
     EgressGateway(TGateway& gateway, const NetworkConfig& config, const ReplicaArbiter& arbiter)
@@ -57,13 +59,13 @@ public:
         mreq.imr_interface.s_addr = INADDR_ANY;
         setsockopt(m_rxFd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
 
-        m_itchFd = socket(AF_INET, SOCK_DGRAM, 0);
+        m_broadcastFd = socket(AF_INET, SOCK_DGRAM, 0);
         unsigned char ttl = 1;
-        setsockopt(m_itchFd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
-        std::memset(&m_itchDestAddr, 0, sizeof(m_itchDestAddr));
-        m_itchDestAddr.sin_family = AF_INET;
-        m_itchDestAddr.sin_port = htons(m_config.itchMulticastPort);
-        inet_pton(AF_INET, m_config.itchMulticastGroup.c_str(), &m_itchDestAddr.sin_addr);
+        setsockopt(m_broadcastFd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+        std::memset(&m_broadcastDestAddr, 0, sizeof(m_broadcastDestAddr));
+        m_broadcastDestAddr.sin_family = AF_INET;
+        m_broadcastDestAddr.sin_port = htons(m_config.publicBroadcastPort);
+        inet_pton(AF_INET, m_config.publicBroadcastIp.c_str(), &m_broadcastDestAddr.sin_addr);
 
         m_running.store(true);
         m_worker = std::thread(&EgressGateway::rxLoop, this);
@@ -74,9 +76,9 @@ public:
         m_running.store(false);
         if (m_worker.joinable()) m_worker.join();
         if (m_rxFd != -1) close(m_rxFd);
-        if (m_itchFd != -1) close(m_itchFd);
+        if (m_broadcastFd != -1) close(m_broadcastFd);
         m_rxFd = -1;
-        m_itchFd = -1;
+        m_broadcastFd = -1;
     }
 
 private:
@@ -93,7 +95,7 @@ private:
             const TEvent& evt = msg.payload;
             printEvent(evt);
 
-            auto frame = EncodeOrderEventFrame(evt);
+            auto frame = TEncoder::encode(evt);
 
             // Private ack — silently dropped if the originating client has
             // since disconnected (a stale/unknown sessionId is expected,
@@ -101,22 +103,15 @@ private:
             m_gateway.sendToSession(evt.session_id, frame.data(), frame.size());
 
             // Public feed — always broadcast regardless of session.
-            sendto(m_itchFd, frame.data(), frame.size(), 0,
-                (struct sockaddr*)&m_itchDestAddr, sizeof(m_itchDestAddr));
+            sendto(m_broadcastFd, frame.data(), frame.size(), 0,
+                (struct sockaddr*)&m_broadcastDestAddr, sizeof(m_broadcastDestAddr));
         }
     }
 
     static void printEvent(const TEvent& evt) {
-        std::cout << "[egress] type=" << EncodeOrderEventTypeByte(evt.type)
-                  << " order_id=" << evt.order_id
-                  << " session_id=" << evt.session_id
-                  << " side=" << (evt.side == SIDE::BID ? 'B' : evt.side == SIDE::ASK ? 'S' : '-')
-                  << " price=" << static_cast<int>(evt.price)
-                  << " qty=" << evt.quantity
-                  << " leaves=" << evt.leaves_quantity
-                  << " match_id=" << evt.match_id
-                  << " reject_reason=" << static_cast<int>(evt.reject_reason)
-                  << "\n";
+        std::cout << "[egress] ";
+        TEncoder::print(std::cout, evt);
+        std::cout << "\n";
     }
 
     TGateway& m_gateway;
@@ -125,6 +120,6 @@ private:
     std::atomic<bool> m_running{ false };
     std::thread m_worker;
     int m_rxFd{ -1 };
-    int m_itchFd{ -1 };
-    sockaddr_in m_itchDestAddr{};
+    int m_broadcastFd{ -1 };
+    sockaddr_in m_broadcastDestAddr{};
 };

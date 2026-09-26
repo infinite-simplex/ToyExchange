@@ -1,5 +1,5 @@
 #pragma once
-#include <IGoodTillDayScheduler.hpp>
+#include "IGoodTillDayScheduler.hpp"
 #include "SPSCQueue.hpp"
 #include "NetworkConfig.hpp"
 
@@ -100,7 +100,7 @@ private:
 
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
-        addr.sin_port = htons(m_config.ouchListenPort);
+        addr.sin_port = htons(m_config.ingressListenPort);
         inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr); // same-host as NetworkGateway
 
         if (connect(sock, (sockaddr*)&addr, sizeof(addr)) < 0) {

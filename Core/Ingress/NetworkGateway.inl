@@ -37,7 +37,7 @@ void NetworkGateway<TProtocolHandler, TCommand>::start() {
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(m_config.ouchListenPort);
+    address.sin_port = htons(m_config.ingressListenPort);
     if (bind(m_listenSocket, (struct sockaddr*)&address, sizeof(address)) < 0) {
         close(m_listenSocket);
         throw std::system_error(errno, std::generic_category(), "Unable to bind TCP listen socket");

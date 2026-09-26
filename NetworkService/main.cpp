@@ -1,5 +1,6 @@
 #include "EgressGateway.hpp"
 #include "NetworkGateway.hpp"
+#include "OrderEventFrame.hpp"
 #include "ReplicaArbiter.hpp"
 #include "RetransmitServer.hpp"
 #include "OuchProtocolHandler.hpp"
@@ -35,7 +36,7 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
 
-        if (arg == "--ouch-port") config.ouchListenPort = static_cast<uint16_t>(std::stoi(next()));
+        if (arg == "--ouch-port") config.ingressListenPort = static_cast<uint16_t>(std::stoi(next()));
         else if (arg == "--multicast-ip") config.multicastIp = next();
         else if (arg == "--multicast-port") config.multicastPort = static_cast<uint16_t>(std::stoi(next()));
         else if (arg == "--retransmit-port") config.retransmitServerPort = static_cast<uint16_t>(std::stoi(next()));
@@ -43,8 +44,8 @@ int main(int argc, char** argv) {
         else if (arg == "--symbol") symbols.push_back(next());
         else if (arg == "--egress-ip") config.egressMulticastIp = next();
         else if (arg == "--egress-port") config.egressMulticastPort = static_cast<uint16_t>(std::stoi(next()));
-        else if (arg == "--itch-ip") config.itchMulticastGroup = next();
-        else if (arg == "--itch-port") config.itchMulticastPort = static_cast<uint16_t>(std::stoi(next()));
+        else if (arg == "--itch-ip") config.publicBroadcastIp = next();
+        else if (arg == "--itch-port") config.publicBroadcastPort = static_cast<uint16_t>(std::stoi(next()));
         else if (arg == "--arbitration-port") config.arbitrationPort = static_cast<uint16_t>(std::stoi(next()));
         else {
             std::cerr << "Unknown argument: " << arg << "\n";
@@ -81,17 +82,17 @@ int main(int argc, char** argv) {
         gateway.sequenceStore(), config.retransmitServerPort);
 
     // Arbitrates which MatchingService replica may currently publish egress
-    // (see NetworkService/Arbitration/); EgressGateway fences on its epoch.
+    // (see Core/Arbitration/); EgressGateway fences on its epoch.
     ReplicaArbiter arbiter(config.arbitrationPort);
 
-    EgressGateway<NetworkGateway<OuchProtocolHandler, OuchOrderCommand>, OrderEvent> egressGateway(
-        gateway, config, arbiter);
+    EgressGateway<NetworkGateway<OuchProtocolHandler, OuchOrderCommand>, OrderEvent, OuchEventEncoder>
+        egressGateway(gateway, config, arbiter);
 
-    std::cout << "NetworkService starting: OUCH listen :" << config.ouchListenPort
+    std::cout << "NetworkService starting: OUCH listen :" << config.ingressListenPort
               << ", replication multicast " << config.multicastIp << ":" << config.multicastPort
               << ", retransmit :" << config.retransmitServerPort
               << ", egress from " << config.egressMulticastIp << ":" << config.egressMulticastPort
-              << ", ITCH broadcast " << config.itchMulticastGroup << ":" << config.itchMulticastPort
+              << ", ITCH broadcast " << config.publicBroadcastIp << ":" << config.publicBroadcastPort
               << ", arbitration :" << config.arbitrationPort
               << ", symbols:";
     for (const auto& symbol : symbols) std::cout << " " << symbol;

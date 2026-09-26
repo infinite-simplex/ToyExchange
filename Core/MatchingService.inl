@@ -1,28 +1,28 @@
 #include "Telemetry.hpp"
 
-template <typename TCommand>
-MatchingService<TCommand>::MatchingService(SPSCQueue<TCommand>& inboundQueue, OrderBook<SPSCProducerPolicy>& lob)
+template <typename TCommand, typename TEngine>
+MatchingService<TCommand, TEngine>::MatchingService(SPSCQueue<TCommand>& inboundQueue, TEngine& engine)
 	: m_inboundQueue{ inboundQueue }
-	, m_lob{ lob }
+	, m_engine{ engine }
 	{ }
 
-template <typename TCommand>
-void MatchingService<TCommand>::start() {
+template <typename TCommand, typename TEngine>
+void MatchingService<TCommand, TEngine>::start() {
 	if (m_running.load()) return;
 	m_running.store(true);
 
 	m_matchingThread = std::thread(&MatchingService::poll, this);
 }
 
-template <typename TCommand>
-void MatchingService<TCommand>::stop() {
+template <typename TCommand, typename TEngine>
+void MatchingService<TCommand, TEngine>::stop() {
 	if (!m_running.load()) return;
 	m_running.store(false);
 	if (m_matchingThread.joinable()) m_matchingThread.join();
 }
 
-template <typename TCommand>
-void MatchingService<TCommand>::poll() {
+template <typename TCommand, typename TEngine>
+void MatchingService<TCommand, TEngine>::poll() {
 	while (m_running.load(std::memory_order_relaxed)) {
 		TCommand cmd;
 
@@ -35,8 +35,7 @@ void MatchingService<TCommand>::poll() {
 
 		OrderTrace& trace = g_telemetry_arena[trace_index(cmd.trace_id)];
 		trace.engine_pop_tai_ns = get_synced_time_ns(); // compared against ingress_tai_ns, stamped on a different machine
-		//we have an inbound command, send to the orderbook
-		m_lob.submit_order(cmd);
+		m_engine.submit_order(cmd);
 		trace.match_done_tai_ns = get_synced_time_ns();
 		m_lastAppliedSeq.store(cmd.trace_id, std::memory_order_relaxed);
 	}

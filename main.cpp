@@ -1,5 +1,6 @@
 #include "MatchingService.hpp"
 #include "NetworkGateway.hpp"
+#include "OrderBook.hpp"
 #include "SPSCProducerPolicy.hpp"
 #include <iostream>
 #include <random>
@@ -48,8 +49,8 @@ int main() {
     SPSCQueue<OrderTrace, 16384> trace_q;
 
     // 1. Instantiate policy with valid queue references
-    SPSCProducerPolicy policy{ event_q, trace_q };
-    auto LOB = new OrderBook<SPSCProducerPolicy>(policy);
+    SPSCProducerPolicy<OrderEvent> policy{ event_q, trace_q };
+    auto LOB = new OrderBook<SPSCProducerPolicy<OrderEvent>>(policy);
 
     for (int i = 0; i < 100; ++i) {
         auto o = GetRandomOrder();

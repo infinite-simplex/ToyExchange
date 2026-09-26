@@ -25,6 +25,12 @@ namespace {
     void handleSignal(int) { g_shutdownRequested.store(true); }
 }
 
+// This process's concrete instantiation of the generic replica host over
+// the event-contract engine — named once here so it doesn't need repeating
+// (and re-deriving) at every use below.
+using Engine = OrderBook<SPSCProducerPolicy<OrderEvent>>;
+using Matcher = MatchingService<OuchOrderCommand, Engine>;
+
 int main(int argc, char** argv) {
     NetworkConfig config;
     std::string replicaId = "replica-1";
@@ -81,17 +87,16 @@ int main(int argc, char** argv) {
     auto eventQueue = std::make_unique<SPSCQueue<OrderEvent, 16384>>();
     auto traceQueue = std::make_unique<SPSCQueue<OrderTrace, 16384>>();
 
-    SPSCProducerPolicy policy{ *eventQueue, *traceQueue };
-    OrderBook<SPSCProducerPolicy> book(policy);
-    MatchingService<OuchOrderCommand> matcher(*inboundQueue, book);
+    SPSCProducerPolicy<OrderEvent> policy{ *eventQueue, *traceQueue };
+    Engine book(policy);
+    Matcher matcher(*inboundQueue, book);
     MulticastIngressReceiver<OuchOrderCommand> receiver(*inboundQueue, config);
 
     // Tells the gateway's ReplicaArbiter this replica is alive and how far
     // it's gotten, and learns back who's currently allowed to publish —
     // EgressPublisher only sends when this replica believes itself leader.
-    LeaderHeartbeatClient<MatchingService<OuchOrderCommand>> heartbeatClient(
-        numericReplicaId, matcher, config);
-    EgressPublisher<OrderEvent, 16384, LeaderHeartbeatClient<MatchingService<OuchOrderCommand>>>
+    LeaderHeartbeatClient<Matcher> heartbeatClient(numericReplicaId, matcher, config);
+    EgressPublisher<OrderEvent, 16384, LeaderHeartbeatClient<Matcher>>
         egressPublisher(*eventQueue, config, heartbeatClient);
     TelemetryForwarder<16384> telemetryForwarder(*traceQueue, config, numericReplicaId);
 
@@ -102,7 +107,7 @@ int main(int argc, char** argv) {
     // scheduler can only be wired in via set_gtd_scheduler once everything
     // exists. Still happens before matcher.start(), so no command can ever
     // reach the book with the scheduler unset.
-    GtdCancelService<LeaderHeartbeatClient<MatchingService<OuchOrderCommand>>>
+    GtdCancelService<LeaderHeartbeatClient<Matcher>>
         gtdCancelService(config, heartbeatClient);
     book.set_gtd_scheduler(&gtdCancelService);
 

@@ -227,7 +227,7 @@ void PrintUsage() {
     std::cerr <<
         "Usage: OuchTestClient --side B|S --price N --qty N [options]\n"
         "  --host <ip>            default 127.0.0.1\n"
-        "  --port <port>          default 10001 (NetworkConfig::ouchListenPort)\n"
+        "  --port <port>          default 10001 (NetworkConfig::ingressListenPort)\n"
         "  --symbol <name>        default TEST, space-padded/truncated to 8 bytes\n"
         "  --side B|S             required for a new order (not for --replace-token)\n"
         "  --price <0-100>        required, whole cents (this exchange's Price\n"

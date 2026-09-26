@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 #include "MatchingService.hpp"
+#include "OrderBook.hpp"
+#include "SPSCProducerPolicy.hpp"
 #include "NetworkGateway.hpp"
 #include "MulticastIngressReceiver.hpp"
 #include "RetransmitServer.hpp"
@@ -16,7 +18,7 @@
 #include "TelemetryReceiver.hpp"
 #include "TelemetryReport.hpp"
 #include "Aggregator.hpp"
-#include <IGoodTillDayScheduler.hpp>
+#include "IGoodTillDayScheduler.hpp"
 #include <vector>
 #include <cstring>
 #include <chrono>
@@ -36,8 +38,8 @@ class MatchingEngineTest : public ::testing::Test {
 protected:
     std::vector<OrderEvent> events;
     std::vector<OrderTrace> traces;
-    TestingPolicy policy{ events, traces };
-    OrderBook<TestingPolicy> LOB{ policy };
+    TestingPolicy<OrderEvent> policy{ events, traces };
+    OrderBook<TestingPolicy<OrderEvent>> LOB{ policy };
 
     void SetUp() override {
         events.clear();
@@ -681,9 +683,9 @@ class GoodTillDayTest : public ::testing::Test {
 protected:
     std::vector<OrderEvent> events;
     std::vector<OrderTrace> traces;
-    TestingPolicy policy{ events, traces };
+    TestingPolicy<OrderEvent> policy{ events, traces };
     RecordingGtdScheduler scheduler;
-    OrderBook<TestingPolicy> LOB{ policy, &scheduler };
+    OrderBook<TestingPolicy<OrderEvent>> LOB{ policy, &scheduler };
 };
 
 TEST_F(GoodTillDayTest, GoodTillCancelRestsWithoutSchedulingAutoCancel) {
@@ -1394,7 +1396,7 @@ TEST(NetworkIngressPipelineTest, GatewayToReceiverDeliversParsedOrderOverLoopbac
     OuchProtocolHandler handler(registry, orderTokenRegistry);
 
     NetworkConfig config;
-    config.ouchListenPort = 15101;
+    config.ingressListenPort = 15101;
     config.multicastIp = "239.255.0.1";
     config.multicastPort = 25101;
 
@@ -1413,7 +1415,7 @@ TEST(NetworkIngressPipelineTest, GatewayToReceiverDeliversParsedOrderOverLoopbac
     ASSERT_GE(clientFd, 0);
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(config.ouchListenPort);
+    serverAddr.sin_port = htons(config.ingressListenPort);
     inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
     ASSERT_EQ(0, connect(clientFd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
 
@@ -1474,7 +1476,7 @@ TEST(NetworkIngressPipelineTest, BadBodyLengthClosesTheConnection) {
     OuchProtocolHandler handler(registry, orderTokenRegistry);
 
     NetworkConfig config;
-    config.ouchListenPort = 15109;
+    config.ingressListenPort = 15109;
     config.multicastIp = "239.255.0.10";
     config.multicastPort = 25110;
 
@@ -1491,7 +1493,7 @@ TEST(NetworkIngressPipelineTest, BadBodyLengthClosesTheConnection) {
     frame[1] = static_cast<char>(payloadLen & 0xFF);
     frame[2] = 'O';
 
-    EXPECT_TRUE(SendFrameAndCheckConnectionClosed(config.ouchListenPort, frame))
+    EXPECT_TRUE(SendFrameAndCheckConnectionClosed(config.ingressListenPort, frame))
         << "a frame with a body length that can't possibly be a valid ENTER_ORDER should disconnect, not stall";
 
     gateway.stop();
@@ -1504,7 +1506,7 @@ TEST(NetworkIngressPipelineTest, UnrecognizedMessageTypeClosesTheConnection) {
     OuchProtocolHandler handler(registry, orderTokenRegistry);
 
     NetworkConfig config;
-    config.ouchListenPort = 15110;
+    config.ingressListenPort = 15110;
     config.multicastIp = "239.255.0.11";
     config.multicastPort = 25111;
 
@@ -1519,7 +1521,7 @@ TEST(NetworkIngressPipelineTest, UnrecognizedMessageTypeClosesTheConnection) {
     frame[1] = static_cast<char>(payloadLen & 0xFF);
     frame[2] = 'Z'; // not 'O'/'X'/'U'
 
-    EXPECT_TRUE(SendFrameAndCheckConnectionClosed(config.ouchListenPort, frame))
+    EXPECT_TRUE(SendFrameAndCheckConnectionClosed(config.ingressListenPort, frame))
         << "an unrecognized message type byte should disconnect, not stall";
 
     gateway.stop();
@@ -1532,7 +1534,7 @@ TEST(NetworkIngressPipelineTest, UnknownSymbolIsRejectedNotDisconnected) {
     OuchProtocolHandler handler(registry, orderTokenRegistry);
 
     NetworkConfig config;
-    config.ouchListenPort = 15112;
+    config.ingressListenPort = 15112;
     config.multicastIp = "239.255.0.13";
     config.multicastPort = 25113;
 
@@ -1549,7 +1551,7 @@ TEST(NetworkIngressPipelineTest, UnknownSymbolIsRejectedNotDisconnected) {
     ASSERT_GE(clientFd, 0);
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(config.ouchListenPort);
+    serverAddr.sin_port = htons(config.ingressListenPort);
     inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
     ASSERT_EQ(0, connect(clientFd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
 
@@ -1590,7 +1592,7 @@ TEST(NetworkIngressPipelineTest, OutOfRangePriceIsRejectedNotDisconnected) {
     OuchProtocolHandler handler(registry, orderTokenRegistry);
 
     NetworkConfig config;
-    config.ouchListenPort = 15111;
+    config.ingressListenPort = 15111;
     config.multicastIp = "239.255.0.14";
     config.multicastPort = 25112;
 
@@ -1607,7 +1609,7 @@ TEST(NetworkIngressPipelineTest, OutOfRangePriceIsRejectedNotDisconnected) {
     ASSERT_GE(clientFd, 0);
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(config.ouchListenPort);
+    serverAddr.sin_port = htons(config.ingressListenPort);
     inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
     ASSERT_EQ(0, connect(clientFd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
 
@@ -1650,7 +1652,7 @@ TEST(NetworkIngressPipelineTest, RealOuchFixedPointPriceIsDecodedToCents) {
     OuchProtocolHandler handler(registry, orderTokenRegistry);
 
     NetworkConfig config;
-    config.ouchListenPort = 15113;
+    config.ingressListenPort = 15113;
     config.multicastIp = "239.255.0.15";
     config.multicastPort = 25116;
 
@@ -1667,7 +1669,7 @@ TEST(NetworkIngressPipelineTest, RealOuchFixedPointPriceIsDecodedToCents) {
     ASSERT_GE(clientFd, 0);
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(config.ouchListenPort);
+    serverAddr.sin_port = htons(config.ingressListenPort);
     inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
     ASSERT_EQ(0, connect(clientFd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
 
@@ -1717,7 +1719,7 @@ TEST(NetworkIngressPipelineTest, TimeInForceMapsToOrderType) {
     OuchProtocolHandler handler(registry, orderTokenRegistry);
 
     NetworkConfig config;
-    config.ouchListenPort = 15114;
+    config.ingressListenPort = 15114;
     config.multicastIp = "239.255.0.16";
     config.multicastPort = 25117;
 
@@ -1734,7 +1736,7 @@ TEST(NetworkIngressPipelineTest, TimeInForceMapsToOrderType) {
     ASSERT_GE(clientFd, 0);
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(config.ouchListenPort);
+    serverAddr.sin_port = htons(config.ingressListenPort);
     inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
     ASSERT_EQ(0, connect(clientFd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
 
@@ -1770,7 +1772,7 @@ TEST(NetworkIngressPipelineTest, ReplaceOrderResolvesExistingIdAndMintsNewOne) {
     OuchProtocolHandler handler(registry, orderTokenRegistry);
 
     NetworkConfig config;
-    config.ouchListenPort = 15106;
+    config.ingressListenPort = 15106;
     config.multicastIp = "239.255.0.6";
     config.multicastPort = 25106;
 
@@ -1788,7 +1790,7 @@ TEST(NetworkIngressPipelineTest, ReplaceOrderResolvesExistingIdAndMintsNewOne) {
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         sockaddr_in serverAddr{};
         serverAddr.sin_family = AF_INET;
-        serverAddr.sin_port = htons(config.ouchListenPort);
+        serverAddr.sin_port = htons(config.ingressListenPort);
         inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
         ASSERT_EQ(0, connect(fd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
         ASSERT_EQ(static_cast<ssize_t>(frame.size()), send(fd, frame.data(), frame.size(), 0));
@@ -1832,7 +1834,7 @@ TEST(NetworkIngressPipelineTest, CancelOrderResolvesExistingTokenToId) {
     OuchProtocolHandler handler(registry, orderTokenRegistry);
 
     NetworkConfig config;
-    config.ouchListenPort = 15107;
+    config.ingressListenPort = 15107;
     config.multicastIp = "239.255.0.7";
     config.multicastPort = 25107;
 
@@ -1850,7 +1852,7 @@ TEST(NetworkIngressPipelineTest, CancelOrderResolvesExistingTokenToId) {
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         sockaddr_in serverAddr{};
         serverAddr.sin_family = AF_INET;
-        serverAddr.sin_port = htons(config.ouchListenPort);
+        serverAddr.sin_port = htons(config.ingressListenPort);
         inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
         ASSERT_EQ(0, connect(fd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
         ASSERT_EQ(static_cast<ssize_t>(frame.size()), send(fd, frame.data(), frame.size(), 0));
@@ -1887,7 +1889,7 @@ TEST(NetworkIngressPipelineTest, CancelOrderWithUnknownTokenResolvesToInvalidOrd
     OuchProtocolHandler handler(registry, orderTokenRegistry);
 
     NetworkConfig config;
-    config.ouchListenPort = 15108;
+    config.ingressListenPort = 15108;
     config.multicastIp = "239.255.0.8";
     config.multicastPort = 25108;
 
@@ -1904,7 +1906,7 @@ TEST(NetworkIngressPipelineTest, CancelOrderWithUnknownTokenResolvesToInvalidOrd
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(config.ouchListenPort);
+    serverAddr.sin_port = htons(config.ingressListenPort);
     inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
     ASSERT_EQ(0, connect(fd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
 
@@ -1931,7 +1933,7 @@ TEST(NetworkIngressPipelineTest, DistinctFirmIdsAllowOuchOrdersToMatch) {
     OuchProtocolHandler handler(registry, orderTokenRegistry);
 
     NetworkConfig config;
-    config.ouchListenPort = 15105;
+    config.ingressListenPort = 15105;
     config.multicastIp = "239.255.0.5";
     config.multicastPort = 25105;
 
@@ -1945,10 +1947,10 @@ TEST(NetworkIngressPipelineTest, DistinctFirmIdsAllowOuchOrdersToMatch) {
 
     SPSCQueue<OrderEvent, 16384> eventQ;
     SPSCQueue<OrderTrace, 16384> traceQ;
-    SPSCProducerPolicy policy{ eventQ, traceQ };
-    OrderBook<SPSCProducerPolicy> lob{ policy };
+    SPSCProducerPolicy<OrderEvent> policy{ eventQ, traceQ };
+    OrderBook<SPSCProducerPolicy<OrderEvent>> lob{ policy };
 
-    MatchingService<OuchOrderCommand> matchingService(inboundQueue, lob);
+    MatchingService<OuchOrderCommand, OrderBook<SPSCProducerPolicy<OrderEvent>>> matchingService(inboundQueue, lob);
     matchingService.start();
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -1957,7 +1959,7 @@ TEST(NetworkIngressPipelineTest, DistinctFirmIdsAllowOuchOrdersToMatch) {
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         sockaddr_in serverAddr{};
         serverAddr.sin_family = AF_INET;
-        serverAddr.sin_port = htons(config.ouchListenPort);
+        serverAddr.sin_port = htons(config.ingressListenPort);
         inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
         ASSERT_EQ(0, connect(fd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
         ASSERT_EQ(static_cast<ssize_t>(frame.size()), send(fd, frame.data(), frame.size(), 0));
@@ -2135,7 +2137,7 @@ TEST(NetworkIngressPipelineTest, TelemetryIsCapturedConsistentlyAcrossStages) {
     OuchProtocolHandler handler(registry, orderTokenRegistry);
 
     NetworkConfig config;
-    config.ouchListenPort = 15103;
+    config.ingressListenPort = 15103;
     config.multicastIp = "239.255.0.3";
     config.multicastPort = 25103;
 
@@ -2152,10 +2154,10 @@ TEST(NetworkIngressPipelineTest, TelemetryIsCapturedConsistentlyAcrossStages) {
     // TestingPolicy's plain std::vectors aren't safe to share across threads.
     SPSCQueue<OrderEvent, 16384> eventQ;
     SPSCQueue<OrderTrace, 16384> traceQ;
-    SPSCProducerPolicy policy{ eventQ, traceQ };
-    OrderBook<SPSCProducerPolicy> lob{ policy };
+    SPSCProducerPolicy<OrderEvent> policy{ eventQ, traceQ };
+    OrderBook<SPSCProducerPolicy<OrderEvent>> lob{ policy };
 
-    MatchingService<OuchOrderCommand> matchingService(inboundQueue, lob);
+    MatchingService<OuchOrderCommand, OrderBook<SPSCProducerPolicy<OrderEvent>>> matchingService(inboundQueue, lob);
     matchingService.start();
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -2176,7 +2178,7 @@ TEST(NetworkIngressPipelineTest, TelemetryIsCapturedConsistentlyAcrossStages) {
     ASSERT_GE(clientFd, 0);
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(config.ouchListenPort);
+    serverAddr.sin_port = htons(config.ingressListenPort);
     inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
     ASSERT_EQ(0, connect(clientFd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
 
@@ -2239,7 +2241,7 @@ TEST(NetworkIngressPipelineTest, GtdCancelServiceFiresScheduledCancelWithinBound
     OuchProtocolHandler handler(registry, orderTokenRegistry);
 
     NetworkConfig config;
-    config.ouchListenPort = 15104;
+    config.ingressListenPort = 15104;
     config.multicastIp = "239.255.0.4";
     config.multicastPort = 25104;
 
@@ -2253,10 +2255,10 @@ TEST(NetworkIngressPipelineTest, GtdCancelServiceFiresScheduledCancelWithinBound
 
     SPSCQueue<OrderEvent, 16384> eventQ;
     SPSCQueue<OrderTrace, 16384> traceQ;
-    SPSCProducerPolicy policy{ eventQ, traceQ };
-    OrderBook<SPSCProducerPolicy> lob{ policy };
+    SPSCProducerPolicy<OrderEvent> policy{ eventQ, traceQ };
+    OrderBook<SPSCProducerPolicy<OrderEvent>> lob{ policy };
 
-    MatchingService<OuchOrderCommand> matchingService(inboundQueue, lob);
+    MatchingService<OuchOrderCommand, OrderBook<SPSCProducerPolicy<OrderEvent>>> matchingService(inboundQueue, lob);
     matchingService.start();
 
     // The service itself is just another OUCH TCP client of this same
@@ -2275,7 +2277,7 @@ TEST(NetworkIngressPipelineTest, GtdCancelServiceFiresScheduledCancelWithinBound
     ASSERT_GE(clientFd, 0);
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(config.ouchListenPort);
+    serverAddr.sin_port = htons(config.ingressListenPort);
     inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
     ASSERT_EQ(0, connect(clientFd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
 
@@ -2317,7 +2319,7 @@ TEST(NetworkIngressPipelineTest, GtdCancelServiceDoesNotFireWhenNotLeader) {
     OuchProtocolHandler handler(registry, orderTokenRegistry);
 
     NetworkConfig config;
-    config.ouchListenPort = 15115;
+    config.ingressListenPort = 15115;
     config.multicastIp = "239.255.0.18";
     config.multicastPort = 25118;
 
@@ -2331,10 +2333,10 @@ TEST(NetworkIngressPipelineTest, GtdCancelServiceDoesNotFireWhenNotLeader) {
 
     SPSCQueue<OrderEvent, 16384> eventQ;
     SPSCQueue<OrderTrace, 16384> traceQ;
-    SPSCProducerPolicy policy{ eventQ, traceQ };
-    OrderBook<SPSCProducerPolicy> lob{ policy };
+    SPSCProducerPolicy<OrderEvent> policy{ eventQ, traceQ };
+    OrderBook<SPSCProducerPolicy<OrderEvent>> lob{ policy };
 
-    MatchingService<OuchOrderCommand> matchingService(inboundQueue, lob);
+    MatchingService<OuchOrderCommand, OrderBook<SPSCProducerPolicy<OrderEvent>>> matchingService(inboundQueue, lob);
     matchingService.start();
 
     FakeLeaderCheck fakeLeader;
@@ -2348,7 +2350,7 @@ TEST(NetworkIngressPipelineTest, GtdCancelServiceDoesNotFireWhenNotLeader) {
     ASSERT_GE(clientFd, 0);
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(config.ouchListenPort);
+    serverAddr.sin_port = htons(config.ingressListenPort);
     inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
     ASSERT_EQ(0, connect(clientFd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
 
@@ -2813,7 +2815,7 @@ TEST(TelemetryWraparoundTest, NoCollisionWhenSlotWasProperlyReleased) {
     // completion, before the second claim arrives.
     std::vector<OrderEvent> events;
     std::vector<OrderTrace> traces;
-    TestingPolicy policy{ events, traces };
+    TestingPolicy<OrderEvent> policy{ events, traces };
     complete_trace(policy, firstTrace);
 
     uint64_t afterRelease = g_telemetry_arena_collisions.load(std::memory_order_relaxed);

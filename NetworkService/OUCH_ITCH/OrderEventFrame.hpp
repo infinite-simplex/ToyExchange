@@ -2,6 +2,7 @@
 #include "OrderEvent.hpp"
 
 #include <cstdint>
+#include <ostream>
 #include <vector>
 
 // Generic egress wire frame: one shared encoding for both the private OUCH
@@ -63,3 +64,25 @@ inline std::vector<char> EncodeOrderEventFrame(const OrderEvent& evt) {
 
     return frame;
 }
+
+// Adapts the two free functions above to the TEncoder contract
+// EgressGateway<TGateway, TEvent, TEncoder> requires: static encode() for
+// wire bytes, static print() for the console debug line. Keeps every
+// OUCH-specific field name out of EgressGateway itself.
+struct OuchEventEncoder {
+    static std::vector<char> encode(const OrderEvent& evt) {
+        return EncodeOrderEventFrame(evt);
+    }
+
+    static void print(std::ostream& os, const OrderEvent& evt) {
+        os << "type=" << EncodeOrderEventTypeByte(evt.type)
+           << " order_id=" << evt.order_id
+           << " session_id=" << evt.session_id
+           << " side=" << (evt.side == SIDE::BID ? 'B' : evt.side == SIDE::ASK ? 'S' : '-')
+           << " price=" << static_cast<int>(evt.price)
+           << " qty=" << evt.quantity
+           << " leaves=" << evt.leaves_quantity
+           << " match_id=" << evt.match_id
+           << " reject_reason=" << static_cast<int>(evt.reject_reason);
+    }
+};

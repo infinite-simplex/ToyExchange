@@ -29,7 +29,9 @@ set(HDR_HISTOGRAM_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
 set(HDR_HISTOGRAM_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(hdr_histogram)
 
-# Subdirectories
+# Subdirectories — Core first: it's the reusable exchange pipeline every
+# product (ExchangeCommon/MatchingService/NetworkService today) builds on.
+add_subdirectory(Core)
 add_subdirectory(ExchangeCommon)
 add_subdirectory(MatchingService)
 add_subdirectory(NetworkService)
@@ -38,11 +40,12 @@ add_subdirectory(Tools/OuchTestClient)
 
 # Main Executable
 add_executable(ExchangeMain main.cpp)
-target_link_libraries(ExchangeMain 
-    PRIVATE 
+target_link_libraries(ExchangeMain
+    PRIVATE
         NetworkService
         MatchingService
         ExchangeCommon
+        Core
         Threads::Threads
 )
 
@@ -69,6 +72,7 @@ target_link_libraries(EngineTests
         NetworkService
         PerformanceService
         ExchangeCommon
+        Core
         hdr_histogram::hdr_histogram_static
         Threads::Threads
 )
