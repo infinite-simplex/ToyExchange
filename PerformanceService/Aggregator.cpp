@@ -17,14 +17,19 @@ constexpr MetricRange kMetricRanges[METRIC_COUNT] = {
     { 1, 10'000'000'000LL, 3 },  // QueuingDelayNs — up to 10s
     { 1, 2'048, 2 },              // InboundQDepth
     { 1, 10'000'000LL, 3 },       // InboundQSubmitCycles — raw rdtsc cycles
-    { 1, 128, 2 },                 // PriceLevelsTouched — MAX_LEVELS=101
-    { 1, 100'000, 2 },             // RestingOrdersTouched
+    // Generic range for an opaque product counter — wide enough for a plain
+    // count (a product's own values are typically small integers), not
+    // tuned to any specific meaning since Core doesn't know one.
+    { 1, 1'000'000, 2 },  // ExtCounter0
+    { 1, 1'000'000, 2 },  // ExtCounter1
+    { 1, 1'000'000, 2 },  // ExtCounter2
+    { 1, 1'000'000, 2 },  // ExtCounter3
 };
 
 constexpr const char* kMetricNames[METRIC_COUNT] = {
     "engine_exec_ns", "network_delay_ns", "queuing_delay_ns",
     "inbound_q_depth", "inbound_q_submit_cycles",
-    "price_levels_touched", "resting_orders_touched"
+    "ext_counter_0", "ext_counter_1", "ext_counter_2", "ext_counter_3"
 };
 
 } // namespace
@@ -76,8 +81,11 @@ void Aggregator::record(const TelemetryReport& report) {
     }
     stats.metrics[metric_index(MetricKind::InboundQDepth)].record(static_cast<std::int64_t>(t.inbound_q_depth));
     stats.metrics[metric_index(MetricKind::InboundQSubmitCycles)].record(static_cast<std::int64_t>(t.inbound_q_submitted));
-    stats.metrics[metric_index(MetricKind::PriceLevelsTouched)].record(static_cast<std::int64_t>(t.price_levels_touched));
-    stats.metrics[metric_index(MetricKind::RestingOrdersTouched)].record(static_cast<std::int64_t>(t.resting_orders_touched));
+
+    constexpr std::size_t firstExtSlot = metric_index(MetricKind::ExtCounter0);
+    for (std::size_t i = 0; i < t.ext_counters.size(); ++i) {
+        stats.metrics[firstExtSlot + i].record(static_cast<std::int64_t>(t.ext_counters[i]));
+    }
 
     // Released last, after every map/histogram write above — a caller on
     // another thread that observes this count (acquire) is guaranteed to see

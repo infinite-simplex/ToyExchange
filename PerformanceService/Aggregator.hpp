@@ -19,8 +19,16 @@ enum class MetricKind : std::uint8_t {
     InboundQSubmitCycles,   // diagnostic: LOCAL rdtsc cycles — only meaningful as a
                             // trend for one replica over time, never comparable in
                             // absolute terms across replicas/machines.
-    PriceLevelsTouched,     // "why was it slow" diagnostic
-    RestingOrdersTouched,   // "why was it slow" diagnostic
+
+    // Raw pass-through of OrderTrace::ext_counters — Core windows/percentiles
+    // these identically to every other metric without knowing what a product
+    // put in them (see OrderTrace's doc comment in Telemetry.hpp). A product
+    // maps its own enum onto these four slots; kMetricNames below stays
+    // generic since Core has nothing more specific to call them.
+    ExtCounter0,
+    ExtCounter1,
+    ExtCounter2,
+    ExtCounter3,
     Count
 };
 constexpr std::size_t METRIC_COUNT = static_cast<std::size_t>(MetricKind::Count);

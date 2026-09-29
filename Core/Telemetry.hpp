@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstddef>
@@ -32,9 +33,18 @@ struct alignas(64) OrderTrace {
                                                 // compared across a machine boundary need get_synced_time_ns().
     // Written by Matching Engine Thread
     std::uint64_t engine_pop_tai_ns{ 0 };      // Nanoseconds since the TAI epoch when popped from queue
-    std::uint64_t match_done_tai_ns{ 0 };      // Nanoseconds since the TAI epoch after LOB execution
-    std::uint32_t resting_orders_touched{ 0 }; // Number of fills generated
-    std::uint16_t price_levels_touched{ 0 };   // Number of price levels traversed
+    std::uint64_t match_done_tai_ns{ 0 };      // Nanoseconds since the TAI epoch after engine execution
+
+    // Opaque, product-defined counters — Core neither reads nor assigns any
+    // meaning to these, only reserves the space and carries them through to
+    // PerformanceService as raw windowable int64s (see MetricKind::ExtCounter0
+    // etc. in Aggregator.hpp). A product defines its own enum mapping slot
+    // index -> meaning (e.g. the event-contract book's LobExtSlot) and writes
+    // through it from its own matching engine. Four slots was a free choice,
+    // not a budget: today's engine-thread fields sum to 48 bytes, and
+    // alignas(64) already pads that to 64 regardless of how many of the four
+    // int32 slots any given product actually uses.
+    std::array<std::int32_t, 4> ext_counters{};
 };
 static_assert(sizeof(OrderTrace) == 64, "OrderTrace is alignas(64) specifically to fit one cache "
     "line — a field change that pushes it past 64 bytes doubles the arena's footprint silently.");
