@@ -1,50 +1,23 @@
 #pragma once
-#include <chrono>
 #include <cstdint>
 
-using Price = std::uint8_t;
-// This exchange's whole price domain: event-contract cents, 0-100 inclusive.
-// Shared here since OuchProtocolHandler (NetworkService) needs the same
-// bounds to validate a real OUCH price on ingress without NetworkService
-// linking MatchingService; OrderBook.hpp's m_price_levels array is indexed
-// directly by Price using these same bounds.
-constexpr Price WORST_BID = 0;
-constexpr Price WORST_ASK = 100;
-using Quantity = std::int32_t;
-using OrderId = std::uint64_t;
-constexpr OrderId INVALID_ORDER_ID = 0; // real ids are assigned starting at 1
-using ExecutionId = std::uint64_t;
-using FirmId = std::uint32_t;
-using PoolIdx = std::uint32_t;
-using Clock = std::chrono::steady_clock;
 using TraceId = std::uint32_t; // Wraps around every 4.2 billion orders
 constexpr TraceId INVALID_TRACE_ID = 0xFFFFFFFFu; // trace_id 0 is a real, assigned value
                                                    // (the very first command), so unlike
                                                    // OrderId/SessionId this can't reuse 0
 
-// Nanoseconds since the TAI epoch (see get_synced_time_ns() in
-// Telemetry.hpp). Deliberately not a std::chrono::steady_clock::time_point:
-// steady_clock's epoch is implementation-defined and arbitrary per machine
-// (typically boot time), so it has exactly the same cross-machine
-// incomparability problem as a raw TSC value — an OrderEvent stamped on one
-// machine and read/compared on another needs a real, synchronized wall-clock
-// reading. (std::chrono::tai_clock, the typed C++20 equivalent, isn't
-// implemented on this toolchain, hence the plain integer.)
-using Timestamp = std::uint64_t;
-
 // Opaque per-connection correlation tag, minted once by NetworkGateway when a
-// client connects and stamped onto every command it sends. Carried through
-// OuchOrderCommand -> Order -> OrderEvent unchanged (same pattern as
-// FirmId/TraceId) so egress can route a response back to the right client
-// without a side-table order_id -> connection lookup, which would go stale
-// for long-resting orders once a fd gets closed and reused. See
-// NetworkGateway::sendToSession.
+// client connects and stamped onto every command it sends. Carried unchanged
+// from a product's inbound command through to its outbound event (same
+// pattern as TraceId) so egress can route a response back to the right
+// client without a side-table lookup, which would go stale for long-resting
+// orders once a fd gets closed and reused. See NetworkGateway::sendToSession.
 using SessionId = std::uint32_t;
 constexpr SessionId INVALID_SESSION_ID = 0; // real session ids are assigned starting at 1
 
 // Static, operator-assigned identity for a MatchingService replica (see
-// NetworkService/Arbitration/). Small range — only ever a handful of
-// replicas — unlike SessionId, which churns per client connection.
+// Core/Arbitration/). Small range — only ever a handful of replicas —
+// unlike SessionId, which churns per client connection.
 using ReplicaId = std::uint16_t;
 constexpr ReplicaId INVALID_REPLICA_ID = 0; // real replica ids are assigned starting at 1
 
