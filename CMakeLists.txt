@@ -62,20 +62,30 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
-# Add Test Executable
-add_executable(EngineTests Testing.cpp)
-
-target_link_libraries(EngineTests
+# Two test executables, split along the same line the repo itself will
+# eventually split on: CoreTests touches nothing product-specific, so it can
+# move with Core; ProductTests exercises the OUCH product and stays behind.
+add_executable(CoreTests Testing.cpp)
+target_link_libraries(CoreTests
     PRIVATE
         gtest_main
-        MatchingService
-        NetworkService
         PerformanceService
-        ExchangeCommon
         Core
         hdr_histogram::hdr_histogram_static
         Threads::Threads
 )
 
+add_executable(ProductTests ProductTesting.cpp)
+target_link_libraries(ProductTests
+    PRIVATE
+        gtest_main
+        MatchingService
+        NetworkService
+        ExchangeCommon
+        Core
+        Threads::Threads
+)
+
 include(GoogleTest)
-gtest_discover_tests(EngineTests)
+gtest_discover_tests(CoreTests)
+gtest_discover_tests(ProductTests)
