@@ -2,56 +2,45 @@
 
 [![CI](https://github.com/infinite-simplex/ToyExchange/actions/workflows/ci.yml/badge.svg)](https://github.com/infinite-simplex/ToyExchange/actions/workflows/ci.yml)
 
-A low-latency exchange engine built around an LMAX Disruptor-style
-pipeline — lock-free SPSC ring buffers, a replicated and leader-elected
-matching tier with real failover, NASDAQ OUCH/ITCH wire protocols. The
-pipeline itself is product-agnostic: `NetworkGateway`/`MatchingService` are
-templated on the wire protocol and command type, so a new product plugs its
-own matching logic into the same ingress → replication → egress pipeline
-rather than rebuilding it.
+A low-latency exchange pipeline built around an LMAX Disruptor-style
+core — lock-free SPSC ring buffers, a replicated and leader-elected matching
+tier with real failover, a sequenced ingress gateway with a durable log and
+gap-fill retransmit. The pipeline is product-agnostic: `NetworkGateway` and
+`MatchingService` are templated on the wire protocol and command type, so a
+product plugs its own matching logic into the same ingress → replication →
+egress pipeline rather than rebuilding it.
 
 This is a portfolio project, not a production exchange.
 
-## Order books
+## What's here
 
-- **Event contract exchange** — implemented. Binary-outcome contracts
-  priced 0-100. The first product built on the pipeline.
-- **GPU compute exchange** — planned, not yet implemented. Trading GPU
-  compute capacity as the second product, proving the pipeline generalizes
-  beyond one order book.
+Just the reusable core (`Core/`) and its telemetry/aggregation tooling
+(`PerformanceService/`) — no product logic. Products consume this repo as a
+dependency rather than living inside it.
 
-## Architecture
+## Products built on it
 
-Three processes: **NetworkServiceApp** (gateway — OUCH ingress, sequencing,
-durable log with gap-fill retransmit, leader arbitration, egress),
-**MatchingServiceApp** (N replicas of the matching engine, only the elected
-leader publishes), **PerformanceServiceApp** (HdrHistogram latency
-percentiles aggregated across replicas). Real NASDAQ OUCH 4.2 wire format
-on ingress; a custom compact frame on egress (no public ITCH feed yet).
+- **[EventContractLOB](https://github.com/infinite-simplex/EventContractLOB)**
+  — a NASDAQ OUCH/ITCH-speaking limit order book for binary-outcome event
+  contracts. The reference implementation; start there to see the pipeline
+  in use.
+- **GPU compute exchange** — planned, not yet implemented. A frequent
+  batch auction for GPU compute capacity, proving the pipeline generalizes
+  beyond a continuous limit order book.
 
 Design rationale and tradeoffs are written up separately outside this repo.
 
 ## Building and running
 
 Linux only (uses `epoll`, `mmap`, multicast sockets, `CLOCK_TAI` directly —
-on Windows, build under WSL).
+on Windows, build under WSL). This repo alone only builds `Core` and
+`PerformanceService`; there's no standalone executable here — see a product
+repo (e.g. EventContractLOB) to run the exchange end to end.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j"$(nproc)"
-./run_exchange.sh 2 build
 ```
-
-Then, from another shell:
-
-```bash
-build/Tools/OuchTestClient/OuchTestClient --side B --price 50 --qty 10 --firm-id 1
-build/Tools/OuchTestClient/OuchTestClient --side S --price 50 --qty 10 --firm-id 2 --listen-ms 500
-```
-
-`./kill_leader.sh run` kills only the current leader replica, to watch
-failover happen live. `tail -f run/performance.log` shows latency
-percentiles.
 
 ## Testing
 
@@ -59,8 +48,10 @@ percentiles.
 ctest --test-dir build --output-on-failure
 ```
 
-87 tests: matching engine, full network ingress pipeline, leader
-arbitration, telemetry, performance aggregation. CI runs this on every push.
+Core primitives only: replica arbitration, telemetry, performance
+aggregation. A product repo carries its own tests for whatever it builds on
+top (matching engine, wire protocol, ingress pipeline). CI runs this on
+every push.
 
 ## License
 

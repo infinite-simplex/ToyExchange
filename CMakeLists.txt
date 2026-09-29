@@ -29,25 +29,8 @@ set(HDR_HISTOGRAM_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
 set(HDR_HISTOGRAM_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(hdr_histogram)
 
-# Subdirectories — Core first: it's the reusable exchange pipeline every
-# product (ExchangeCommon/MatchingService/NetworkService today) builds on.
 add_subdirectory(Core)
-add_subdirectory(ExchangeCommon)
-add_subdirectory(MatchingService)
-add_subdirectory(NetworkService)
 add_subdirectory(PerformanceService)
-add_subdirectory(Tools/OuchTestClient)
-
-# Main Executable
-add_executable(ExchangeMain main.cpp)
-target_link_libraries(ExchangeMain
-    PRIVATE
-        NetworkService
-        MatchingService
-        ExchangeCommon
-        Core
-        Threads::Threads
-)
 
 # ==============================================================================
 # Testing Setup (GoogleTest + CTest)
@@ -62,9 +45,6 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
-# Two test executables, split along the same line the repo itself will
-# eventually split on: CoreTests touches nothing product-specific, so it can
-# move with Core; ProductTests exercises the OUCH product and stays behind.
 add_executable(CoreTests Testing.cpp)
 target_link_libraries(CoreTests
     PRIVATE
@@ -75,17 +55,5 @@ target_link_libraries(CoreTests
         Threads::Threads
 )
 
-add_executable(ProductTests ProductTesting.cpp)
-target_link_libraries(ProductTests
-    PRIVATE
-        gtest_main
-        MatchingService
-        NetworkService
-        ExchangeCommon
-        Core
-        Threads::Threads
-)
-
 include(GoogleTest)
 gtest_discover_tests(CoreTests)
-gtest_discover_tests(ProductTests)
