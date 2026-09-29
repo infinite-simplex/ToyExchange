@@ -37,7 +37,9 @@ public:
 
         // MAP_POPULATE should prefault, but zero explicitly too, so a
         // pre-existing file's leftover bytes never masquerade as a valid slot.
-        std::memset(m_slots, 0, fileSize);
+        // Raw file-backed bytes, not constructed objects, so the void* cast is
+        // deliberate (silences -Wclass-memaccess for non-trivial TCommand).
+        std::memset(static_cast<void*>(m_slots), 0, fileSize);
         mlock(m_slots, fileSize); // best-effort; fine if it's denied
     }
 

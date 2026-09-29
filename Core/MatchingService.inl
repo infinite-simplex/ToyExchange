@@ -2,8 +2,8 @@
 
 template <typename TCommand, typename TEngine>
 MatchingService<TCommand, TEngine>::MatchingService(SPSCQueue<TCommand>& inboundQueue, TEngine& engine)
-	: m_inboundQueue{ inboundQueue }
-	, m_engine{ engine }
+	: m_engine{ engine }
+	, m_inboundQueue{ inboundQueue }
 	{ }
 
 template <typename TCommand, typename TEngine>
