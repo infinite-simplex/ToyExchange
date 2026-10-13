@@ -24,11 +24,12 @@ dependency rather than living inside it.
   — a NASDAQ OUCH/ITCH-speaking limit order book for binary-outcome event
   contracts. The reference implementation; start there to see the pipeline
   in use.
-- **GPU compute exchange** — planned, not yet implemented. A frequent
+- **[BatchGPU](https://github.com/infinite-simplex/BatchGPU)** — a frequent
   batch auction for GPU compute capacity, proving the pipeline generalizes
   beyond a continuous limit order book.
 
-Design rationale and tradeoffs are written up separately outside this repo.
+Design rationale and tradeoffs are written up in the
+[Toy Exchange Core design write-up](https://infinite-simplex.github.io/InfiniteLabs/#ToyExchangeCore).
 
 ## Building and running
 
