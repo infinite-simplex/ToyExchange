@@ -16,16 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # googletest and HdrHistogram_c are fetched at configure time via
-      # CMake FetchContent (see CMakeLists.txt) rather than installed as
-      # system packages. Caching build/_deps skips re-downloading them on
-      # every run; the cache key is invalidated automatically whenever the
-      # pinned versions in CMakeLists.txt change.
-      - name: Cache CMake FetchContent dependencies
-        uses: actions/cache@v4
-        with:
-          path: build/_deps
-          key: ${{ runner.os }}-fetchcontent-${{ hashFiles('CMakeLists.txt') }}
+      # Do not cache build/_deps: it holds compiled googletest, built with
+      # -march=native (see CMakeLists.txt). Restored onto a runner with a
+      # different CPU, that library crashes with SIGILL at test teardown.
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
