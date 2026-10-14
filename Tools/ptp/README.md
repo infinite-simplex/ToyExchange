@@ -4,7 +4,7 @@
 
 `NetworkGateway` stamps `ingress_tai_ns` on its own host; `MatchingService`
 replicas stamp `engine_pop_tai_ns`/`match_done_tai_ns` on theirs (see
-`ExchangeCommon/Telemetry.hpp`). These values are only meaningful diffed
+`Core/Telemetry.hpp`). These values are only meaningful diffed
 against each other if the two hosts' clocks actually agree — plain NTP gets
 you roughly 1-10ms of accuracy, which is worse than the latencies this
 system is trying to measure. Software PTP (`linuxptp`, no special NIC
@@ -82,9 +82,18 @@ sudo journalctl -u ptp4l-slave -f
 sudo pmc -u -b 0 'GET CURRENT_DATA_SET'
 ```
 
-Then, as an application-level sanity check: run `NetworkServiceApp` on the
-master host and a `MatchingServiceApp` replica on a slave host, send an
-order through, and confirm `engine_pop_tai_ns - ingress_tai_ns` (currently
-only visible by inspecting `g_telemetry_arena` directly — there's no CLI
-surface for it yet) comes out as a small positive number rather than
-something wildly large or negative.
+Then, as an application-level sanity check, run a product's gateway
+(`NetworkServiceApp`) on the master host and one of its matching replicas
+(`MatchingServiceApp`) on a slave host. Both live in a product repo such as
+EventContractLOB, not in this repo. Run `PerformanceServiceApp` from this
+repo alongside them. Send an order through, then read the `network_delay_ns`
+lines it prints. That metric is `replica_ingress_tai_ns - ingress_tai_ns`.
+It is the one delta that crosses a machine boundary, so clock error shows up
+in it directly. Expect small positive values.
+
+Watch for two failure signs:
+
+- Huge values mean the replica clock runs ahead of the gateway clock.
+- A low `n=` compared with `engine_exec_ns`, or no `network_delay_ns` lines
+  at all, means the replica clock runs behind. The aggregator drops negative
+  deltas instead of recording them.
