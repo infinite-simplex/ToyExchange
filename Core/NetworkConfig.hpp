@@ -31,6 +31,15 @@ struct NetworkConfig {
     // sequence gap triggers recovery.
     bool ingressIdleProbe = true;
 
+    // Kernel receive buffer that MulticastIngressReceiver asks for, on both the
+    // multicast socket and the retransmit-reply socket. The Linux default is
+    // 212,992 bytes, and a burst of commands can overflow it while the receiver
+    // thread waits for room in a full inbound queue. Every datagram lost that
+    // way forces a retransmit. Linux caps the request at net.core.rmem_max, so
+    // raise that sysctl on the host to at least this value; the receiver prints
+    // a warning at start-up when the cap clips the request.
+    int ingressReceiveBufferBytes = 4 * 1024 * 1024;
+
     // Internal results-egress channel: each MatchingService replica's
     // EgressPublisher multicasts every raw event it produces here, and
     // NetworkServiceApp's EgressGateway joins it to derive both the private

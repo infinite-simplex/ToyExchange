@@ -3,6 +3,7 @@
 #include "SequencedInboundMessage.hpp"
 #include "RetransmitMessage.hpp"
 #include "NetworkConfig.hpp"
+#include "ReceiveBuffer.hpp"
 #include "Telemetry.hpp"
 
 #include <atomic>
@@ -46,6 +47,13 @@ public:
         int opt = 1;
         setsockopt(m_udpFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
+        m_receiveBufferBytes = SetReceiveBuffer(m_udpFd, m_config.ingressReceiveBufferBytes);
+        if (m_receiveBufferBytes < m_config.ingressReceiveBufferBytes) {
+            std::cerr << "[WARNING] Ingress receive buffer is " << m_receiveBufferBytes
+                << " bytes, below the " << m_config.ingressReceiveBufferBytes
+                << " requested. Raise net.core.rmem_max on this host, or bursts can drop datagrams.\n";
+        }
+
         // Bounded timeout so rxLoop wakes up periodically to re-check m_running
         // instead of relying on a concurrent close() from stop() to unblock recv().
         // It is also the idle interval after which rxLoop probes for a missed tail.
@@ -82,6 +90,11 @@ public:
     // rxLoop's FATAL branch). Polled by main() alongside its own shutdown
     // flag — this replica cannot be trusted to keep running.
     bool hitUnrecoverableGap() const { return m_hitUnrecoverableGap.load(std::memory_order_relaxed); }
+
+    // Receive buffer the kernel granted the multicast socket, in bytes. Valid
+    // after start(); below NetworkConfig::ingressReceiveBufferBytes when
+    // net.core.rmem_max clipped the request.
+    int receiveBufferBytes() const { return m_receiveBufferBytes; }
 
 private:
     using Message = SequencedInboundMessage<TCommand>;
@@ -227,10 +240,16 @@ private:
     // no longer holds a record (Evicted); neither answer changes on a retry,
     // so neither is retried. A silent or partial reply is retried up to
     // maxAttempts times per batch, each retry asking only for the records
-    // still missing so none is pushed twice.
+    // still missing so none is pushed twice. Each reply carries its sequence
+    // number, and only the reply for the next missing record is used, so a
+    // lost, duplicated or stale datagram can never take another record's place.
     FetchResult fetchRange(uint64_t startSeq, uint64_t count, int maxAttempts) {
         int sock = socket(AF_INET, SOCK_DGRAM, 0);
         if (sock < 0) return { FetchOutcome::Unavailable, 0 };
+
+        // The server sends a batch of up to 500 datagrams back to back, and
+        // this thread stops reading while the inbound queue is full.
+        SetReceiveBuffer(sock, m_config.ingressReceiveBufferBytes);
 
         timeval timeout{};
         timeout.tv_sec = 0;
@@ -274,6 +293,13 @@ private:
 
                     RetransmitRecordHeader hdr{};
                     std::memcpy(&hdr, packet, sizeof(hdr));
+
+                    // A reply counts only if it answers the sequence number
+                    // still missing. A later one means the reply for seq was
+                    // lost. An earlier one is a duplicate, or a stale reply
+                    // from an earlier attempt or batch on this socket. Ignore
+                    // both; the retry below resumes from seq.
+                    if (hdr.sequenceNumber != seq) continue;
 
                     if (hdr.status == RetransmitStatus::TOO_OLD) {
                         outcome = FetchOutcome::Evicted;
@@ -320,5 +346,6 @@ private:
     std::atomic<bool> m_running{ false };
     std::thread m_worker;
     int m_udpFd{ -1 };
+    int m_receiveBufferBytes{ 0 };
     std::atomic<bool> m_hitUnrecoverableGap{ false };
 };

@@ -1,6 +1,7 @@
 // Ingress recovery: what happens when a replica joins late, restarts, loses
 // the tail of a burst, loses part of a retransmit reply, or is sent the same
-// datagram twice.
+// datagram twice, and that it asks the kernel for the receive buffer it is
+// configured to use.
 //
 // Core has no protocol or product command type of its own, so these tests use
 // a minimal stand-in (TestCommand) with the real SequenceStore,
@@ -21,6 +22,7 @@
 #include "SequencedInboundMessage.hpp"
 #include "RetransmitMessage.hpp"
 #include "NetworkConfig.hpp"
+#include "ReceiveBuffer.hpp"
 #include "SPSCQueue.hpp"
 #include "Alias.hpp"
 
@@ -28,7 +30,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <set>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -134,16 +138,25 @@ bool WaitForUnrecoverableGap(const MulticastIngressReceiver<TestCommand>& receiv
     return receiver.hitUnrecoverableGap();
 }
 
-// A retransmit server whose FIRST reply is cut short, as if the rest of its
-// datagrams were dropped on the wire. Every later request is answered in full,
-// from whatever start sequence and count the request asks for, like the real
-// server does.
-class LossyRetransmitServer {
+std::set<uint64_t> SequenceRange(uint64_t first, uint64_t last) { // first .. last-1
+    std::set<uint64_t> range;
+    for (uint64_t seq = first; seq < last; ++seq) range.insert(seq);
+    return range;
+}
+
+// A retransmit server that damages its replies the way a network can. It
+// answers like the real server, from whatever start sequence and count a
+// request asks for, with two faults on top:
+//   lostOnce        record datagrams the network drops the first time the
+//                   server sends them. A retry gets them.
+//   duplicateReplies  every record datagram arrives twice.
+class UnreliableRetransmitServer {
 public:
-    LossyRetransmitServer(SequenceStore<TestCommand>& store, uint16_t port, uint32_t firstReplyRecords)
-        : m_store(store), m_port(port), m_firstReplyRecords(firstReplyRecords) {
+    UnreliableRetransmitServer(SequenceStore<TestCommand>& store, uint16_t port,
+        std::set<uint64_t> lostOnce, bool duplicateReplies = false)
+        : m_store(store), m_port(port), m_lostOnce(std::move(lostOnce)), m_duplicateReplies(duplicateReplies) {
     }
-    ~LossyRetransmitServer() { stop(); }
+    ~UnreliableRetransmitServer() { stop(); }
 
     void start() {
         m_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -158,7 +171,7 @@ public:
         addr.sin_port = htons(m_port);
         bind(m_fd, (sockaddr*)&addr, sizeof(addr));
         m_running.store(true);
-        m_thread = std::thread(&LossyRetransmitServer::serve, this);
+        m_thread = std::thread(&UnreliableRetransmitServer::serve, this);
     }
 
     void stop() {
@@ -176,27 +189,33 @@ private:
             ssize_t n = recvfrom(m_fd, &req, sizeof(req), 0, (sockaddr*)&from, &fromLen);
             if (n != static_cast<ssize_t>(sizeof(req))) continue;
 
-            uint32_t reply = std::min<uint32_t>(req.count, RETRANSMIT_BATCH);
-            if (m_requests.fetch_add(1) == 0) reply = std::min(reply, m_firstReplyRecords);
-
+            const uint32_t reply = std::min<uint32_t>(req.count, RETRANSMIT_BATCH);
             for (uint32_t i = 0; i < reply; ++i) {
+                const uint64_t seq = req.startSeq + i;
                 TestMessage record{};
-                if (m_store.read(req.startSeq + i, record) != SequenceStore<TestCommand>::ReadResult::OK) break;
-                RetransmitRecordHeader hdr{ RetransmitStatus::OK, {}, req.startSeq + i };
+                if (m_store.read(seq, record) != SequenceStore<TestCommand>::ReadResult::OK) {
+                    RetransmitRecordHeader end{ RetransmitStatus::NOT_YET_ARRIVED, {}, seq };
+                    sendto(m_fd, &end, sizeof(end), 0, (sockaddr*)&from, fromLen);
+                    break;
+                }
+                if (m_lostOnce.erase(seq) != 0) continue; // dropped on the wire
+
+                RetransmitRecordHeader hdr{ RetransmitStatus::OK, {}, seq };
                 char packet[sizeof(hdr) + sizeof(record)];
                 std::memcpy(packet, &hdr, sizeof(hdr));
                 std::memcpy(packet + sizeof(hdr), &record, sizeof(record));
                 sendto(m_fd, packet, sizeof(packet), 0, (sockaddr*)&from, fromLen);
+                if (m_duplicateReplies) sendto(m_fd, packet, sizeof(packet), 0, (sockaddr*)&from, fromLen);
             }
         }
     }
 
     SequenceStore<TestCommand>& m_store;
     uint16_t m_port;
-    uint32_t m_firstReplyRecords;
+    std::set<uint64_t> m_lostOnce; // touched only by the server thread
+    bool m_duplicateReplies;
     int m_fd{ -1 };
     std::atomic<bool> m_running{ false };
-    std::atomic<uint32_t> m_requests{ 0 };
     std::thread m_thread;
 };
 
@@ -342,18 +361,19 @@ TEST(IngressRecoveryTest, JoinerStopsWhenOneMoreMessageEvictsSequenceZero) {
 }
 
 // =====================================================================
-// Retry after a partly lost retransmit reply (idle probe off)
+// Damaged retransmit replies (idle probe off, except where stated)
 // =====================================================================
 
-TEST(IngressRecoveryTest, RetryAfterPartialBatchDoesNotDuplicateOrSkipRecords) {
-    constexpr uint64_t HISTORY = 600;               // one full batch of 500, then 100
-    constexpr uint32_t DELIVERED_BEFORE_LOSS = 100; // first reply stops after 100 of the 500
-    SequenceStore<TestCommand> store("/tmp/toyexchange_ingress_lossy.dat", 1024);
+// A late joiner finds sequence 0 .. HISTORY-1 in the store, learns it is behind
+// from the live datagram HISTORY, and replays the history through `server`.
+// The history is one full batch of 500, then 100.
+static void ExpectReplayThrough(UnreliableRetransmitServer& server, SequenceStore<TestCommand>& store,
+    const char* group, uint16_t multicastPort, uint16_t retransmitPort) {
+    constexpr uint64_t HISTORY = 600;
     for (uint64_t seq = 0; seq < HISTORY; ++seq) store.append(MakeMessage(seq));
 
-    LossyRetransmitServer server(store, 45305, DELIVERED_BEFORE_LOSS);
     server.start();
-    const NetworkConfig config = MakeConfig("239.255.1.5", 25205, 45305, false);
+    const NetworkConfig config = MakeConfig(group, multicastPort, retransmitPort, false);
     SPSCQueue<TestCommand> queue;
     MulticastIngressReceiver<TestCommand> receiver(queue, config);
     receiver.start();
@@ -366,6 +386,53 @@ TEST(IngressRecoveryTest, RetryAfterPartialBatchDoesNotDuplicateOrSkipRecords) {
     ExpectInOrder(Drain(queue, HISTORY + 1), HISTORY + 1);
     TestCommand extra{};
     EXPECT_FALSE(PopWithin(queue, extra, NOTHING_ARRIVES_WAIT)) << "a duplicate command followed the replay";
+    EXPECT_FALSE(receiver.hitUnrecoverableGap());
+
+    receiver.stop();
+    server.stop();
+}
+
+TEST(IngressRecoveryTest, RetryAfterPartialBatchDoesNotDuplicateOrSkipRecords) {
+    // The network drops the end of the first reply: records 100 .. 499.
+    SequenceStore<TestCommand> store("/tmp/toyexchange_ingress_lossy.dat", 1024);
+    UnreliableRetransmitServer server(store, 45305, SequenceRange(100, 500));
+    ExpectReplayThrough(server, store, "239.255.1.5", 25205, 45305);
+}
+
+TEST(IngressRecoveryTest, RecordLostInTheMiddleOfAReplyIsNotReplacedByALaterOne) {
+    // The network drops records 100 .. 123 but delivers 124 .. 499 after them.
+    // The receiver must not take record 124 as the one it still waits for.
+    SequenceStore<TestCommand> store("/tmp/toyexchange_ingress_lossy_middle.dat", 1024);
+    UnreliableRetransmitServer server(store, 45311, SequenceRange(100, 124));
+    ExpectReplayThrough(server, store, "239.255.1.11", 25211, 45311);
+}
+
+TEST(IngressRecoveryTest, DuplicatedRetransmitRepliesAreNotAppliedTwice) {
+    // Every record datagram arrives twice. The copy of record 499 is still in
+    // the socket when the second batch starts, so it is a stale reply there.
+    SequenceStore<TestCommand> store("/tmp/toyexchange_ingress_lossy_dup.dat", 1024);
+    UnreliableRetransmitServer server(store, 45312, {}, true);
+    ExpectReplayThrough(server, store, "239.255.1.12", 25212, 45312);
+}
+
+TEST(IngressRecoveryTest, IdleProbeResumesAtARecordLostInTheMiddleOfAReply) {
+    // No live datagram: the idle probe finds the ten stored records. The network
+    // drops record 3. The first probe delivers 0 .. 2 and ignores 4 .. 9, and
+    // the next probe, one idle timeout later, delivers 3 .. 9.
+    constexpr uint64_t STORED = 10;
+    SequenceStore<TestCommand> store("/tmp/toyexchange_ingress_probe_middle.dat", 1024);
+    for (uint64_t seq = 0; seq < STORED; ++seq) store.append(MakeMessage(seq));
+
+    UnreliableRetransmitServer server(store, 45313, { 3 });
+    server.start();
+    const NetworkConfig config = MakeConfig("239.255.1.13", 25213, 45313, true);
+    SPSCQueue<TestCommand> queue;
+    MulticastIngressReceiver<TestCommand> receiver(queue, config);
+    receiver.start();
+
+    ExpectInOrder(Drain(queue, STORED), STORED);
+    TestCommand extra{};
+    EXPECT_FALSE(PopWithin(queue, extra, TWO_IDLE_TIMEOUTS)) << "a duplicate command followed the catch-up";
     EXPECT_FALSE(receiver.hitUnrecoverableGap());
 
     receiver.stop();
@@ -513,4 +580,37 @@ TEST(IngressRecoveryTest, UnreachableRetransmitServerDoesNotStopTheReplicaOrBloc
     ExpectInOrder(Drain(queue, 1), 1);
 
     receiver.stop();
+}
+
+// =====================================================================
+// Receive buffer
+// =====================================================================
+
+TEST(IngressRecoveryTest, ReceiveBufferDefaultsToFourMebibytes) {
+    EXPECT_EQ(4 * 1024 * 1024, NetworkConfig{}.ingressReceiveBufferBytes);
+}
+
+TEST(IngressRecoveryTest, ReceiverAppliesTheConfiguredReceiveBuffer) {
+    constexpr int REQUESTED = 64 * 1024; // far below any net.core.rmem_max, so the kernel grants it in full
+    NetworkConfig config = MakeConfig("239.255.1.30", 25230, 45330, false);
+    config.ingressReceiveBufferBytes = REQUESTED;
+    SPSCQueue<TestCommand> queue;
+    MulticastIngressReceiver<TestCommand> receiver(queue, config);
+    receiver.start();
+
+    EXPECT_EQ(REQUESTED, receiver.receiveBufferBytes());
+
+    receiver.stop();
+}
+
+TEST(IngressRecoveryTest, ReceiveBufferHelperReportsWhenTheKernelCapClipsTheRequest) {
+    constexpr int ABSURD = 1 << 30; // 1 GiB, above any real net.core.rmem_max
+    const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(fd, 0);
+
+    const int granted = SetReceiveBuffer(fd, ABSURD);
+    EXPECT_GT(granted, 0);
+    EXPECT_LT(granted, ABSURD) << "the helper must report the clipped size, not the requested one";
+
+    close(fd);
 }
