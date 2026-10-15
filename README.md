@@ -50,9 +50,11 @@ ctest --test-dir build --output-on-failure
 ```
 
 Core primitives only: replica arbitration, telemetry, performance
-aggregation. A product repo carries its own tests for whatever it builds on
-top (matching engine, wire protocol, ingress pipeline). CI runs this on
-every push.
+aggregation, and the ingress recovery path (sequence store, retransmit
+server, multicast receiver — late join, restart, duplicates, lost tails),
+tested with a stand-in command type. A product repo carries its own tests
+for whatever it builds on top (matching engine, wire protocol, the gateway
+end to end). CI runs this on every push.
 
 ## License
 
