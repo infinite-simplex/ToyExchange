@@ -24,6 +24,13 @@ struct NetworkConfig {
     std::string retransmitServerIp = "127.0.0.1";
     uint16_t retransmitServerPort = 40001;
 
+    // After a full receive timeout with no datagram, MulticastIngressReceiver
+    // asks the retransmit server whether it missed anything, so a replica that
+    // just (re)started or lost the tail of a burst catches up without waiting
+    // for the next live command. false = only a live datagram that reveals a
+    // sequence gap triggers recovery.
+    bool ingressIdleProbe = true;
+
     // Internal results-egress channel: each MatchingService replica's
     // EgressPublisher multicasts every raw event it produces here, and
     // NetworkServiceApp's EgressGateway joins it to derive both the private

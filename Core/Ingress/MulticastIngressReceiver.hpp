@@ -6,6 +6,8 @@
 #include "Telemetry.hpp"
 
 #include <atomic>
+#include <cerrno>
+#include <cstdint>
 #include <thread>
 #include <cstring>
 #include <sys/socket.h>
@@ -19,6 +21,14 @@
 // NetworkGateway builds and sends, detects sequence gaps, recovers them via
 // RetransmitServer<TCommand> (see RetransmitProtocol.hpp), and pushes each
 // TCommand into the local Orderbook Input Disruptor (SPSCQueue<TCommand>).
+//
+// Two things reveal that this replica is behind. A live datagram whose
+// sequence number is ahead of the one expected shows a gap in the middle of
+// the stream. A full receive timeout with no datagram at all shows nothing by
+// itself, so the receiver asks the retransmit server whether anything exists
+// past its position (NetworkConfig::ingressIdleProbe). That second check is
+// what catches a replica that just started or restarted, and one that lost
+// the tail of a burst, without waiting for the next live command.
 template <typename TCommand>
 class MulticastIngressReceiver {
 public:
@@ -38,6 +48,7 @@ public:
 
         // Bounded timeout so rxLoop wakes up periodically to re-check m_running
         // instead of relying on a concurrent close() from stop() to unblock recv().
+        // It is also the idle interval after which rxLoop probes for a missed tail.
         timeval rxTimeout{};
         rxTimeout.tv_sec = 0;
         rxTimeout.tv_usec = 200'000; // 200ms
@@ -75,14 +86,53 @@ public:
 private:
     using Message = SequencedInboundMessage<TCommand>;
 
+    static constexpr uint32_t MAX_BATCH = 500; // must match RetransmitServer::MAX_BATCH
+    static constexpr int MAX_ATTEMPTS = 3;     // per batch, when a live datagram revealed the gap
+    static constexpr int PROBE_ATTEMPTS = 1;   // an idle probe simply runs again at the next timeout
+
+    enum class FetchOutcome {
+        Complete,     // every requested record was delivered
+        ReachedTail,  // the server has nothing further yet (NOT_YET_ARRIVED)
+        Evicted,      // the server no longer holds a requested record (TOO_OLD)
+        Unavailable,  // no usable reply (timeout, malformed, socket error) or shutdown
+    };
+    struct FetchResult {
+        FetchOutcome outcome;
+        uint64_t delivered; // records pushed into the queue, whatever the outcome
+    };
+
     void rxLoop() {
         uint64_t expectedSeq = 0; // matches NetworkGateway::m_sequenceNumber, which starts at 0
 
         while (m_running.load(std::memory_order_relaxed)) {
             Message msg{};
             ssize_t len = recv(m_udpFd, &msg, sizeof(msg), 0);
+
+            if (len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                // A full receive timeout with no datagram. If this replica
+                // missed the last datagrams before the sender went quiet, or
+                // has only just started, no later datagram will ever reveal
+                // that — so ask.
+                if (m_config.ingressIdleProbe && !probeForMissedTail(expectedSeq)) return;
+                continue;
+            }
             if (len < static_cast<ssize_t>(sizeof(Message))) {
                 continue; // Fragmented or faulty packet drop
+            }
+
+            // Delivery is strictly in order from 0, so everything below
+            // expectedSeq has already been delivered exactly once. An older
+            // datagram is therefore a copy of something already applied: a
+            // network duplicate, a late reordered packet, or a live datagram
+            // that a retransmit reached first. Applying it again would apply
+            // the command twice. (It is also what a restarted gateway looks
+            // like, since its sequence starts again at 0 — replicas must be
+            // restarted along with the gateway.)
+            if (msg.sequenceNumber < expectedSeq) {
+                std::cerr << "[WARNING] Ignoring already-delivered datagram. Expected: "
+                    << expectedSeq << " Got: " << msg.sequenceNumber
+                    << " (network duplicate, or the gateway restarted)\n";
+                continue;
             }
 
             // Sequence gap checking
@@ -90,25 +140,23 @@ private:
                 std::cerr << "[WARNING] Sequence gap detected! Expected: "
                     << expectedSeq << " Got: " << msg.sequenceNumber << "\n";
 
-                if (msg.sequenceNumber > expectedSeq) {
-                    uint64_t gapCount = msg.sequenceNumber - expectedSeq;
-                    if (!requestRetransmit(expectedSeq, gapCount)) {
-                        // Unrecoverable: SequenceStore is a ring buffer that only
-                        // moves forward, so once a range is evicted it is gone for
-                        // good — no future retry, restart included, can ever fill
-                        // it. This replica's book is now permanently incomplete
-                        // and cannot be trusted with anything further. Stop rather
-                        // than silently continuing on known-wrong state; main()
-                        // polls hitUnrecoverableGap() and shuts the process down,
-                        // and ReplicaArbiter's existing heartbeat-staleness check
-                        // excludes a gone replica from leadership exactly like a
-                        // crash would — no separate signaling needed.
-                        std::cerr << "[FATAL] Unrecoverable sequence gap [" << expectedSeq << ", "
-                            << msg.sequenceNumber << "); this replica's book is permanently "
-                            << "incomplete, stopping.\n";
-                        m_hitUnrecoverableGap.store(true, std::memory_order_relaxed);
-                        return;
-                    }
+                const uint64_t gapCount = msg.sequenceNumber - expectedSeq;
+                if (fetchRange(expectedSeq, gapCount, MAX_ATTEMPTS).outcome != FetchOutcome::Complete) {
+                    // Unrecoverable: SequenceStore is a ring buffer that only
+                    // moves forward, so once a range is evicted it is gone for
+                    // good — no future retry, restart included, can ever fill
+                    // it. This replica's book is now permanently incomplete
+                    // and cannot be trusted with anything further. Stop rather
+                    // than silently continuing on known-wrong state; main()
+                    // polls hitUnrecoverableGap() and shuts the process down,
+                    // and ReplicaArbiter's existing heartbeat-staleness check
+                    // excludes a gone replica from leadership exactly like a
+                    // crash would — no separate signaling needed.
+                    std::cerr << "[FATAL] Unrecoverable sequence gap [" << expectedSeq << ", "
+                        << msg.sequenceNumber << "); this replica's book is permanently "
+                        << "incomplete, stopping.\n";
+                    m_hitUnrecoverableGap.store(true, std::memory_order_relaxed);
+                    return;
                 }
                 expectedSeq = msg.sequenceNumber;
             }
@@ -116,6 +164,23 @@ private:
 
             pushWithTelemetry(msg);
         }
+    }
+
+    // Asks the retransmit server for everything from expectedSeq onward and
+    // advances expectedSeq past whatever arrives. Returns false only when the
+    // replica must stop: the history it needs is no longer in the gateway's
+    // store. An unreachable server is not fatal — the next idle timeout tries
+    // again — and "nothing past this point yet" simply means caught up.
+    bool probeForMissedTail(uint64_t& expectedSeq) {
+        const FetchResult result = fetchRange(expectedSeq, UINT64_MAX, PROBE_ATTEMPTS);
+        expectedSeq += result.delivered;
+        if (result.outcome != FetchOutcome::Evicted) return true;
+
+        std::cerr << "[FATAL] Unrecoverable sequence gap starting at " << expectedSeq
+            << ": the gateway's store no longer holds it; this replica's book is "
+            << "permanently incomplete, stopping.\n";
+        m_hitUnrecoverableGap.store(true, std::memory_order_relaxed);
+        return false;
     }
 
     // This is the "Ingress Server Thread" from OrderTrace's point of view for
@@ -126,7 +191,7 @@ private:
     // cheap local rdtsc (self-consistent, both reads on this machine), and
     // records the resulting queue depth — then pushes into the local
     // Orderbook Input Disruptor (SPSC Queue). Used for both live traffic and
-    // gap-filled records recovered via requestRetransmit, so recovered orders
+    // gap-filled records recovered via fetchRange, so recovered orders
     // get the same telemetry as ones that arrived live.
     // Returns false only if shutdown was requested mid-push (queue stayed full).
     bool pushWithTelemetry(const Message& msg) {
@@ -156,17 +221,16 @@ private:
         return true;
     }
 
-    // Requests [startSeq, startSeq + count) from RetransmitServer<TCommand> and
-    // pushes recovered records into the queue in order. Returns false if the
-    // server didn't fully satisfy the request (unreachable, too old, not yet
-    // arrived) — the caller resyncs to live traffic in that case rather than
-    // blocking the consumer thread indefinitely.
-    bool requestRetransmit(uint64_t startSeq, uint64_t count) {
-        static constexpr uint32_t MAX_BATCH = 500; // must match RetransmitServer::MAX_BATCH
-        static constexpr int MAX_ATTEMPTS = 3;
-
+    // Requests [startSeq, startSeq + count) from RetransmitServer<TCommand> in
+    // batches and pushes recovered records into the queue in order. Stops
+    // early when the server reports it has nothing further (ReachedTail) or
+    // no longer holds a record (Evicted); neither answer changes on a retry,
+    // so neither is retried. A silent or partial reply is retried up to
+    // maxAttempts times per batch, each retry asking only for the records
+    // still missing so none is pushed twice.
+    FetchResult fetchRange(uint64_t startSeq, uint64_t count, int maxAttempts) {
         int sock = socket(AF_INET, SOCK_DGRAM, 0);
-        if (sock < 0) return false;
+        if (sock < 0) return { FetchOutcome::Unavailable, 0 };
 
         timeval timeout{};
         timeout.tv_sec = 0;
@@ -178,63 +242,77 @@ private:
         serverAddr.sin_port = htons(m_config.retransmitServerPort);
         inet_pton(AF_INET, m_config.retransmitServerIp.c_str(), &serverAddr.sin_addr);
 
-        bool fullyRecovered = true;
+        FetchOutcome outcome = FetchOutcome::Complete;
         uint64_t seq = startSeq;
         uint64_t remaining = count;
 
-        while (remaining > 0) {
-            uint32_t batch = static_cast<uint32_t>(remaining > MAX_BATCH ? MAX_BATCH : remaining);
-            RetransmitRequest req{ seq, batch };
+        while (remaining > 0 && outcome == FetchOutcome::Complete) {
+            if (!m_running.load(std::memory_order_relaxed)) {
+                outcome = FetchOutcome::Unavailable;
+                break;
+            }
 
-            bool batchOk = false;
-            for (int attempt = 0; attempt < MAX_ATTEMPTS && !batchOk; ++attempt) {
+            const uint32_t batch = static_cast<uint32_t>(remaining > MAX_BATCH ? MAX_BATCH : remaining);
+            uint32_t received = 0;
+            bool definitive = false; // evicted / reached the tail / shutting down: a retry cannot help
+
+            for (int attempt = 0; attempt < maxAttempts && received < batch && !definitive; ++attempt) {
+                // seq advances with every record pushed, so a retry resumes
+                // exactly where the previous attempt stopped.
+                RetransmitRequest req{ seq, batch - received };
                 if (sendto(sock, &req, sizeof(req), 0,
                     (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
                     continue;
                 }
 
-                uint32_t received = 0;
                 while (received < batch) {
                     char packet[sizeof(RetransmitRecordHeader) + sizeof(Message)];
                     ssize_t n = recv(sock, packet, sizeof(packet), 0);
                     if (n < static_cast<ssize_t>(sizeof(RetransmitRecordHeader))) {
-                        break; // timeout or malformed response — retry the batch
+                        break; // timeout or malformed response — retry the rest of the batch
                     }
 
                     RetransmitRecordHeader hdr{};
                     std::memcpy(&hdr, packet, sizeof(hdr));
 
-                    if (hdr.status != RetransmitStatus::OK) {
-                        break; // rest of the batch is equally unavailable
+                    if (hdr.status == RetransmitStatus::TOO_OLD) {
+                        outcome = FetchOutcome::Evicted;
+                        definitive = true;
+                        break;
+                    }
+                    if (hdr.status == RetransmitStatus::NOT_YET_ARRIVED) {
+                        outcome = FetchOutcome::ReachedTail;
+                        definitive = true;
+                        break;
                     }
                     if (n != static_cast<ssize_t>(sizeof(packet))) {
-                        break; // truncated record — retry the batch
+                        break; // truncated record — retry the rest of the batch
                     }
 
                     Message record{};
                     std::memcpy(&record, packet + sizeof(hdr), sizeof(record));
 
                     if (!pushWithTelemetry(record)) {
-                        close(sock);
-                        return false;
+                        outcome = FetchOutcome::Unavailable;
+                        definitive = true;
+                        break;
                     }
 
                     ++seq;
                     ++received;
                 }
-
-                batchOk = (received == batch);
             }
 
-            if (!batchOk) {
-                fullyRecovered = false;
+            if (definitive) break;
+            if (received < batch) {
+                outcome = FetchOutcome::Unavailable;
                 break;
             }
             remaining -= batch;
         }
 
         close(sock);
-        return fullyRecovered;
+        return { outcome, seq - startSeq };
     }
 
     SPSCQueue<TCommand>& m_inboundQueue;
