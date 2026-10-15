@@ -5,9 +5,10 @@
 //
 // Core has no protocol or product command type of its own, so these tests use
 // a minimal stand-in (TestCommand) with the real SequenceStore,
-// RetransmitServer and MulticastIngressReceiver. The gateway is not needed: it
-// does two things per command, append to the store and then multicast, and the
-// tests do those two steps by hand, always in that order.
+// RetransmitServer and MulticastIngressReceiver. The gateway is not needed
+// here: it does two things per command, append to the store and then
+// multicast, and these tests do those two steps by hand, always in that order.
+// GatewayTesting.cpp tests the real gateway.
 //
 // A receiver finds out it is behind in two ways: a live datagram whose
 // sequence number skips ahead (the "lazy" path), or a full receive timeout
@@ -15,16 +16,11 @@
 // Tests that target the lazy path switch the probe off so they stay
 // deterministic; the probe tests leave it on and send no live datagram.
 
-#include <gtest/gtest.h>
-#include "MulticastIngressReceiver.hpp"
+#include "IngressTestSupport.hpp"
 #include "RetransmitServer.hpp"
 #include "SequenceStore.hpp"
-#include "SequencedInboundMessage.hpp"
 #include "RetransmitMessage.hpp"
-#include "NetworkConfig.hpp"
 #include "ReceiveBuffer.hpp"
-#include "SPSCQueue.hpp"
-#include "Alias.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -39,104 +35,9 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
+using namespace ingress_test;
+
 namespace {
-
-struct TestCommand {
-    TraceId trace_id;  // the only field MulticastIngressReceiver reads
-    uint64_t payload;  // derived from the sequence number, so order can be checked
-};
-using TestMessage = SequencedInboundMessage<TestCommand>;
-
-constexpr auto GROUP_JOIN_WAIT = std::chrono::milliseconds(100);
-constexpr auto NOTHING_ARRIVES_WAIT = std::chrono::milliseconds(300);
-constexpr auto TWO_IDLE_TIMEOUTS = std::chrono::milliseconds(700); // receiver idle timeout is 200 ms
-constexpr uint32_t RETRANSMIT_BATCH = 500; // must match RetransmitServer::MAX_BATCH
-
-uint64_t PayloadFor(uint64_t seq) { return seq * 7 + 3; }
-
-TestMessage MakeMessage(uint64_t seq) {
-    TestMessage msg{};
-    msg.sequenceNumber = seq;
-    msg.ingressTaiNs = 1;
-    msg.clientSessionId = 1;
-    msg.command.trace_id = static_cast<TraceId>(seq);
-    msg.command.payload = PayloadFor(seq);
-    return msg;
-}
-
-NetworkConfig MakeConfig(const char* group, uint16_t multicastPort, uint16_t retransmitPort, bool idleProbe) {
-    NetworkConfig config;
-    config.multicastIp = group;
-    config.multicastPort = multicastPort;
-    config.retransmitServerIp = "127.0.0.1";
-    config.retransmitServerPort = retransmitPort;
-    config.ingressIdleProbe = idleProbe;
-    return config;
-}
-
-// Stands in for NetworkGateway's fan-out: one multicast datagram. Call it only
-// after the message is already in the store, as the gateway does.
-void SendLive(const NetworkConfig& config, const TestMessage& msg) {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    ASSERT_GE(fd, 0);
-    sockaddr_in dest{};
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(config.multicastPort);
-    inet_pton(AF_INET, config.multicastIp.c_str(), &dest.sin_addr);
-    ASSERT_EQ(static_cast<ssize_t>(sizeof(msg)),
-        sendto(fd, &msg, sizeof(msg), 0, (sockaddr*)&dest, sizeof(dest)));
-    close(fd);
-}
-
-bool PopWithin(SPSCQueue<TestCommand>& queue, TestCommand& out, std::chrono::milliseconds timeout) {
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (queue.try_pop(out)) return true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    return false;
-}
-
-// Pops until `count` commands have arrived, or until nothing new has arrived
-// for `idleTimeout`. The queue holds fewer commands than a long replay, so the
-// test thread has to drain it while the receiver is still filling it.
-std::vector<TestCommand> Drain(SPSCQueue<TestCommand>& queue, size_t count,
-    std::chrono::milliseconds idleTimeout = std::chrono::seconds(3)) {
-    std::vector<TestCommand> got;
-    got.reserve(count);
-    auto lastProgress = std::chrono::steady_clock::now();
-    while (got.size() < count && std::chrono::steady_clock::now() - lastProgress < idleTimeout) {
-        TestCommand cmd{};
-        if (queue.try_pop(cmd)) {
-            got.push_back(cmd);
-            lastProgress = std::chrono::steady_clock::now();
-        }
-        else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    }
-    return got;
-}
-
-// `got` must be exactly the commands for sequence numbers first .. first+count-1, in order.
-void ExpectInOrder(const std::vector<TestCommand>& got, uint64_t count, uint64_t first = 0) {
-    ASSERT_EQ(count, got.size()) << "wrong number of commands delivered";
-    for (uint64_t i = 0; i < count; ++i) {
-        if (got[i].payload != PayloadFor(first + i)) {
-            ADD_FAILURE() << "first out-of-order or duplicated command at position " << i
-                << ": expected payload " << PayloadFor(first + i) << ", got " << got[i].payload;
-            return;
-        }
-    }
-}
-
-bool WaitForUnrecoverableGap(const MulticastIngressReceiver<TestCommand>& receiver) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-    while (!receiver.hitUnrecoverableGap() && std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    return receiver.hitUnrecoverableGap();
-}
 
 std::set<uint64_t> SequenceRange(uint64_t first, uint64_t last) { // first .. last-1
     std::set<uint64_t> range;
@@ -146,15 +47,20 @@ std::set<uint64_t> SequenceRange(uint64_t first, uint64_t last) { // first .. la
 
 // A retransmit server that damages its replies the way a network can. It
 // answers like the real server, from whatever start sequence and count a
-// request asks for, with two faults on top:
-//   lostOnce        record datagrams the network drops the first time the
-//                   server sends them. A retry gets them.
-//   duplicateReplies  every record datagram arrives twice.
+// request asks for, in datagrams of several records, with three faults on top:
+//   lostOnce          the network drops a reply datagram the first time the
+//                     server sends it, if the datagram holds any of these
+//                     sequence numbers. A retry gets them.
+//   duplicateReplies  every reply datagram arrives twice.
+//   staleOverlap      before the real reply, a stale datagram arrives that
+//                     starts 10 records before the requested start and covers
+//                     20 records, as a late copy of an earlier attempt would.
 class UnreliableRetransmitServer {
 public:
     UnreliableRetransmitServer(SequenceStore<TestCommand>& store, uint16_t port,
-        std::set<uint64_t> lostOnce, bool duplicateReplies = false)
-        : m_store(store), m_port(port), m_lostOnce(std::move(lostOnce)), m_duplicateReplies(duplicateReplies) {
+        std::set<uint64_t> lostOnce, bool duplicateReplies = false, bool staleOverlap = false)
+        : m_store(store), m_port(port), m_lostOnce(std::move(lostOnce)),
+          m_duplicateReplies(duplicateReplies), m_staleOverlap(staleOverlap) {
     }
     ~UnreliableRetransmitServer() { stop(); }
 
@@ -189,31 +95,57 @@ private:
             ssize_t n = recvfrom(m_fd, &req, sizeof(req), 0, (sockaddr*)&from, &fromLen);
             if (n != static_cast<ssize_t>(sizeof(req))) continue;
 
+            if (m_staleOverlap && req.startSeq >= 10) sendRecords(req.startSeq - 10, 20, from, fromLen, false);
+
             const uint32_t reply = std::min<uint32_t>(req.count, RETRANSMIT_BATCH);
-            for (uint32_t i = 0; i < reply; ++i) {
-                const uint64_t seq = req.startSeq + i;
-                TestMessage record{};
-                if (m_store.read(seq, record) != SequenceStore<TestCommand>::ReadResult::OK) {
-                    RetransmitRecordHeader end{ RetransmitStatus::NOT_YET_ARRIVED, {}, seq };
+            uint32_t sent = 0;
+            while (sent < reply) {
+                const uint32_t inPacket = std::min<uint32_t>(reply - sent, RECORDS_PER_DATAGRAM);
+                const uint32_t available = sendRecords(req.startSeq + sent, inPacket, from, fromLen, true);
+                sent += available;
+                if (available < inPacket) { // the store has nothing further
+                    RetransmitReplyHeader end{ RetransmitStatus::NOT_YET_ARRIVED, {}, 0, req.startSeq + sent };
                     sendto(m_fd, &end, sizeof(end), 0, (sockaddr*)&from, fromLen);
                     break;
                 }
-                if (m_lostOnce.erase(seq) != 0) continue; // dropped on the wire
-
-                RetransmitRecordHeader hdr{ RetransmitStatus::OK, {}, seq };
-                char packet[sizeof(hdr) + sizeof(record)];
-                std::memcpy(packet, &hdr, sizeof(hdr));
-                std::memcpy(packet + sizeof(hdr), &record, sizeof(record));
-                sendto(m_fd, packet, sizeof(packet), 0, (sockaddr*)&from, fromLen);
-                if (m_duplicateReplies) sendto(m_fd, packet, sizeof(packet), 0, (sockaddr*)&from, fromLen);
             }
         }
+    }
+
+    // Sends up to `count` stored records from `first` as one datagram and
+    // returns how many it found. `faulty` applies the lostOnce and
+    // duplicateReplies faults; a stale datagram is never faulty.
+    uint32_t sendRecords(uint64_t first, uint32_t count, const sockaddr_in& to, socklen_t toLen, bool faulty) {
+        std::vector<char> packet(sizeof(RetransmitReplyHeader) + count * sizeof(TestMessage));
+        uint32_t found = 0;
+        bool lost = false;
+        while (found < count) {
+            TestMessage record{};
+            if (m_store.read(first + found, record) != SequenceStore<TestCommand>::ReadResult::OK) break;
+            std::memcpy(packet.data() + sizeof(RetransmitReplyHeader) + found * sizeof(TestMessage),
+                &record, sizeof(record));
+            if (faulty && m_lostOnce.erase(first + found) != 0) lost = true;
+            ++found;
+        }
+        if (found == 0) return 0;
+
+        const RetransmitReplyHeader hdr{ RetransmitStatus::OK, {}, found, first };
+        std::memcpy(packet.data(), &hdr, sizeof(hdr));
+        const size_t bytes = sizeof(hdr) + found * sizeof(TestMessage);
+        if (!lost) { // otherwise dropped on the wire
+            sendto(m_fd, packet.data(), bytes, 0, (const sockaddr*)&to, toLen);
+            if (faulty && m_duplicateReplies) sendto(m_fd, packet.data(), bytes, 0, (const sockaddr*)&to, toLen);
+        }
+        return found;
     }
 
     SequenceStore<TestCommand>& m_store;
     uint16_t m_port;
     std::set<uint64_t> m_lostOnce; // touched only by the server thread
     bool m_duplicateReplies;
+    bool m_staleOverlap;
+    static constexpr uint32_t RECORDS_PER_DATAGRAM =
+        static_cast<uint32_t>(RecordsPerDatagram<TestCommand>(DEFAULT_DATAGRAM_MAX_BYTES, sizeof(RetransmitReplyHeader)));
     int m_fd{ -1 };
     std::atomic<bool> m_running{ false };
     std::thread m_thread;
@@ -613,4 +545,254 @@ TEST(IngressRecoveryTest, ReceiveBufferHelperReportsWhenTheKernelCapClipsTheRequ
     EXPECT_LT(granted, ABSURD) << "the helper must report the clipped size, not the requested one";
 
     close(fd);
+}
+
+// =====================================================================
+// Datagrams that carry several records (idle probe off)
+// =====================================================================
+
+TEST(IngressRecoveryTest, OneDatagramCanCarryManyRecords) {
+    const NetworkConfig config = MakeConfig("239.255.1.50", 25250, 45350, false);
+    SPSCQueue<TestCommand> queue;
+    MulticastIngressReceiver<TestCommand> receiver(queue, config);
+    receiver.start();
+    std::this_thread::sleep_for(GROUP_JOIN_WAIT);
+
+    SendDatagram(config, Messages(0, 30));
+    SendDatagram(config, Messages(30, 31)); // a batch of one is still a batch
+    SendDatagram(config, Messages(31, 40));
+
+    ExpectInOrder(Drain(queue, 40), 40);
+    TestCommand extra{};
+    EXPECT_FALSE(PopWithin(queue, extra, NOTHING_ARRIVES_WAIT));
+    EXPECT_FALSE(receiver.hitUnrecoverableGap());
+
+    receiver.stop();
+}
+
+TEST(IngressRecoveryTest, RecordsInsideADatagramThatWereAlreadyDeliveredAreSkipped) {
+    const NetworkConfig config = MakeConfig("239.255.1.51", 25251, 45351, false);
+    SPSCQueue<TestCommand> queue;
+    MulticastIngressReceiver<TestCommand> receiver(queue, config);
+    receiver.start();
+    std::this_thread::sleep_for(GROUP_JOIN_WAIT);
+
+    SendDatagram(config, Messages(0, 5));
+    SendDatagram(config, Messages(3, 9));  // 3 and 4 were delivered, 5 .. 8 are new
+    SendDatagram(config, Messages(9, 12));
+    SendDatagram(config, Messages(0, 12)); // a whole stale copy
+
+    ExpectInOrder(Drain(queue, 12), 12);
+    TestCommand extra{};
+    EXPECT_FALSE(PopWithin(queue, extra, NOTHING_ARRIVES_WAIT)) << "a record was applied twice";
+    EXPECT_FALSE(receiver.hitUnrecoverableGap());
+
+    receiver.stop();
+}
+
+TEST(IngressRecoveryTest, DatagramThatStartsPastTheNextExpectedRecordRecoversTheGapFirst) {
+    SequenceStore<TestCommand> store("/tmp/toyexchange_ingress_batch_gap.dat", 1024);
+    for (uint64_t seq = 0; seq < 10; ++seq) store.append(MakeMessage(seq));
+    RetransmitServer<TestCommand> server(store, 45352);
+    server.start();
+    const NetworkConfig config = MakeConfig("239.255.1.52", 25252, 45352, false);
+    SPSCQueue<TestCommand> queue;
+    MulticastIngressReceiver<TestCommand> receiver(queue, config);
+    receiver.start();
+    std::this_thread::sleep_for(GROUP_JOIN_WAIT);
+
+    SendDatagram(config, Messages(6, 10)); // records 0 .. 5 never arrived
+
+    ExpectInOrder(Drain(queue, 10), 10);
+    TestCommand extra{};
+    EXPECT_FALSE(PopWithin(queue, extra, NOTHING_ARRIVES_WAIT));
+    EXPECT_FALSE(receiver.hitUnrecoverableGap());
+
+    receiver.stop();
+    server.stop();
+}
+
+TEST(IngressRecoveryTest, DatagramThatIsNotAWholeNumberOfRecordsIsDropped) {
+    const NetworkConfig config = MakeConfig("239.255.1.53", 25253, 45353, false);
+    SPSCQueue<TestCommand> queue;
+    MulticastIngressReceiver<TestCommand> receiver(queue, config);
+    receiver.start();
+    std::this_thread::sleep_for(GROUP_JOIN_WAIT);
+
+    SendDatagram(config, Messages(0, 3));
+    std::vector<char> torn(3 * sizeof(TestMessage) + 5); // three records and 5 stray bytes
+    const std::vector<TestMessage> records = Messages(3, 6);
+    std::memcpy(torn.data(), records.data(), 3 * sizeof(TestMessage));
+    SendRaw(config, torn.data(), torn.size());
+    SendDatagram(config, Messages(3, 5));
+
+    ExpectInOrder(Drain(queue, 5), 5);
+    TestCommand extra{};
+    EXPECT_FALSE(PopWithin(queue, extra, NOTHING_ARRIVES_WAIT)) << "a torn datagram must not deliver anything";
+    EXPECT_FALSE(receiver.hitUnrecoverableGap());
+
+    receiver.stop();
+}
+
+// =====================================================================
+// Batched retransmit replies
+// =====================================================================
+
+namespace {
+
+struct ReplyDatagram {
+    RetransmitReplyHeader header;
+    size_t bytes;
+    std::vector<TestMessage> records;
+};
+
+// Sends one request to a retransmit server and collects every reply datagram
+// until the server has been quiet for 200 ms.
+std::vector<ReplyDatagram> RequestAndCollect(uint16_t port, uint64_t startSeq, uint32_t count) {
+    std::vector<ReplyDatagram> replies;
+    const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    timeval timeout{};
+    timeout.tv_usec = 200'000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    sockaddr_in server{};
+    server.sin_family = AF_INET;
+    server.sin_port = htons(port);
+    inet_pton(AF_INET, "127.0.0.1", &server.sin_addr);
+
+    const RetransmitRequest req{ startSeq, count };
+    sendto(fd, &req, sizeof(req), 0, (sockaddr*)&server, sizeof(server));
+
+    std::vector<char> buffer(65535);
+    while (true) {
+        const ssize_t n = recv(fd, buffer.data(), buffer.size(), 0);
+        if (n < static_cast<ssize_t>(sizeof(RetransmitReplyHeader))) break;
+        ReplyDatagram reply{};
+        reply.bytes = static_cast<size_t>(n);
+        std::memcpy(&reply.header, buffer.data(), sizeof(reply.header));
+        for (uint32_t i = 0; i < reply.header.count; ++i) {
+            TestMessage record{};
+            std::memcpy(&record, buffer.data() + sizeof(RetransmitReplyHeader) + i * sizeof(TestMessage), sizeof(record));
+            reply.records.push_back(record);
+        }
+        replies.push_back(std::move(reply));
+    }
+    close(fd);
+    return replies;
+}
+
+} // namespace
+
+TEST(IngressRecoveryTest, RetransmitServerAnswersARangeInFewDatagrams) {
+    constexpr uint32_t RECORDS = 100;
+    const size_t perDatagram = RecordsPerDatagram<TestCommand>(DEFAULT_DATAGRAM_MAX_BYTES, sizeof(RetransmitReplyHeader));
+    ASSERT_GT(perDatagram, 1u) << "the test record must fit several times in one datagram";
+
+    SequenceStore<TestCommand> store("/tmp/toyexchange_ingress_reply_batch.dat", 1024);
+    for (uint64_t seq = 0; seq < RECORDS; ++seq) store.append(MakeMessage(seq));
+    RetransmitServer<TestCommand> server(store, 45360);
+    server.start();
+
+    const std::vector<ReplyDatagram> replies = RequestAndCollect(45360, 0, RECORDS);
+
+    EXPECT_EQ((RECORDS + perDatagram - 1) / perDatagram, replies.size());
+    uint64_t next = 0;
+    for (const ReplyDatagram& reply : replies) {
+        EXPECT_EQ(RetransmitStatus::OK, reply.header.status);
+        EXPECT_LE(reply.bytes, DEFAULT_DATAGRAM_MAX_BYTES);
+        EXPECT_EQ(sizeof(RetransmitReplyHeader) + reply.header.count * sizeof(TestMessage), reply.bytes);
+        EXPECT_EQ(next, reply.header.firstSequence) << "records must continue where the previous datagram ended";
+        for (const TestMessage& record : reply.records) {
+            EXPECT_EQ(next, record.sequenceNumber);
+            EXPECT_EQ(PayloadFor(next), record.command.payload);
+            ++next;
+        }
+    }
+    EXPECT_EQ(RECORDS, next);
+
+    server.stop();
+}
+
+TEST(IngressRecoveryTest, RetransmitServerEndsAShortRangeWithOneStatusDatagram) {
+    SequenceStore<TestCommand> store("/tmp/toyexchange_ingress_reply_status.dat", 64);
+    for (uint64_t seq = 0; seq < 100; ++seq) store.append(MakeMessage(seq)); // ring of 64: 36 .. 99 remain
+    RetransmitServer<TestCommand> server(store, 45361);
+    server.start();
+
+    // 95 .. 99 exist, 100 has not been sequenced yet.
+    const std::vector<ReplyDatagram> tail = RequestAndCollect(45361, 95, 20);
+    ASSERT_EQ(2u, tail.size());
+    EXPECT_EQ(RetransmitStatus::OK, tail[0].header.status);
+    EXPECT_EQ(95u, tail[0].header.firstSequence);
+    EXPECT_EQ(5u, tail[0].header.count);
+    EXPECT_EQ(RetransmitStatus::NOT_YET_ARRIVED, tail[1].header.status);
+    EXPECT_EQ(0u, tail[1].header.count);
+    EXPECT_EQ(100u, tail[1].header.firstSequence);
+
+    // 10 was evicted: the reply is the status alone.
+    const std::vector<ReplyDatagram> evicted = RequestAndCollect(45361, 10, 5);
+    ASSERT_EQ(1u, evicted.size());
+    EXPECT_EQ(RetransmitStatus::TOO_OLD, evicted[0].header.status);
+    EXPECT_EQ(0u, evicted[0].header.count);
+    EXPECT_EQ(10u, evicted[0].header.firstSequence);
+
+    server.stop();
+}
+
+TEST(IngressRecoveryTest, StaleReplyThatOverlapsTheNextNeededRecordIsUsedFromThatRecordOnward) {
+    // Before the real reply to each request that starts at 10 or later, the fake
+    // server sends a late copy of 20 older records, 10 of them before the
+    // start. The receiver must take only the ones it still needs.
+    SequenceStore<TestCommand> store("/tmp/toyexchange_ingress_lossy_overlap.dat", 1024);
+    UnreliableRetransmitServer server(store, 45314, {}, false, true);
+    ExpectReplayThrough(server, store, "239.255.1.14", 25214, 45314);
+}
+
+// =====================================================================
+// Receiver spin window (NetworkConfig::ingressSpinMicros)
+// =====================================================================
+
+TEST(IngressRecoveryTest, ReceiverSpinningIsOffByDefault) {
+    EXPECT_EQ(0u, NetworkConfig{}.ingressSpinMicros);
+}
+
+TEST(IngressRecoveryTest, SpinningReceiverDeliversInOrderAndStillWakesAfterAQuietSpell) {
+    NetworkConfig config = MakeConfig("239.255.1.60", 25260, 45370, false);
+    config.ingressSpinMicros = 500;
+    SPSCQueue<TestCommand> queue;
+    MulticastIngressReceiver<TestCommand> receiver(queue, config);
+    receiver.start();
+    std::this_thread::sleep_for(GROUP_JOIN_WAIT);
+
+    for (uint64_t seq = 0; seq < 200; ++seq) SendLive(config, MakeMessage(seq)); // back to back: the receiver spins between them
+    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 200 times the window: it blocks again
+    for (uint64_t seq = 200; seq < 400; seq += 5) SendDatagram(config, Messages(seq, seq + 5));
+
+    ExpectInOrder(Drain(queue, 400), 400);
+    TestCommand extra{};
+    EXPECT_FALSE(PopWithin(queue, extra, NOTHING_ARRIVES_WAIT));
+    EXPECT_FALSE(receiver.hitUnrecoverableGap());
+
+    const auto stopStarted = std::chrono::steady_clock::now();
+    receiver.stop();
+    EXPECT_LT(std::chrono::steady_clock::now() - stopStarted, std::chrono::seconds(1))
+        << "a spinning receiver must still stop promptly";
+}
+
+TEST(IngressRecoveryTest, SpinningReceiverStillProbesWhenIdle) {
+    SequenceStore<TestCommand> store("/tmp/toyexchange_ingress_spin_probe.dat", 1024);
+    for (uint64_t seq = 0; seq < 10; ++seq) store.append(MakeMessage(seq));
+    RetransmitServer<TestCommand> server(store, 45371);
+    server.start();
+
+    NetworkConfig config = MakeConfig("239.255.1.61", 25261, 45371, true);
+    config.ingressSpinMicros = 500;
+    SPSCQueue<TestCommand> queue;
+    MulticastIngressReceiver<TestCommand> receiver(queue, config);
+    receiver.start(); // no live datagram: nothing to spin after, so the idle probe must still fire
+
+    ExpectInOrder(Drain(queue, 10), 10);
+    EXPECT_FALSE(receiver.hitUnrecoverableGap());
+
+    receiver.stop();
+    server.stop();
 }

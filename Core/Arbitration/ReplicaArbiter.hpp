@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <thread>
 #include <unordered_map>
 #include <sys/socket.h>
@@ -22,12 +23,21 @@
 // -> reply. Recompute happens reactively, only when a heartbeat arrives,
 // not on a separate timer — sufficient with 2+ replicas, since a live
 // replica's own next heartbeat is what triggers noticing a stale leader.
+//
+// A replica is eligible to lead when it is fresh (it heartbeated within
+// staleAfter) and not behind. "Behind" is measured in time, not in commands:
+// a replica is behind when it has not reached the highest sequence number
+// any replica had reported lagWindow ago. A count of commands cannot work at
+// every rate. Replicas heartbeat at their own moments, so two replicas that
+// are fully caught up still report sequence numbers that differ by the
+// command rate times the heartbeat interval. At 500,000 commands per second
+// and a 2 ms interval that is about 1,000 commands.
 class ReplicaArbiter {
 public:
     ReplicaArbiter(uint16_t listenPort,
                    std::chrono::milliseconds staleAfter = std::chrono::milliseconds(10),
-                   uint64_t lagTolerance = 200)
-        : m_listenPort(listenPort), m_staleAfter(staleAfter), m_lagTolerance(lagTolerance) {
+                   std::chrono::milliseconds lagWindow = std::chrono::milliseconds(20))
+        : m_listenPort(listenPort), m_staleAfter(staleAfter), m_lagWindow(lagWindow) {
     }
 
     ~ReplicaArbiter() { stop(); }
@@ -89,9 +99,20 @@ private:
             maxSeq = std::max(maxSeq, status.lastAppliedSeq);
         }
 
+        // lagFloor is the highest sequence number any replica had reported
+        // lagWindow ago: the latest sample at or before that moment. Samples
+        // older than that one are no longer needed. Until the arbiter has run
+        // for a full window there is no such sample, and no replica is behind.
+        m_maxSeqHistory.push_back({ now, maxSeq });
+        const auto cutoff = now - m_lagWindow;
+        while (m_maxSeqHistory.size() > 1 && m_maxSeqHistory[1].when <= cutoff) {
+            m_maxSeqHistory.pop_front();
+        }
+        const uint64_t lagFloor = (m_maxSeqHistory.front().when <= cutoff) ? m_maxSeqHistory.front().maxSeq : 0;
+
         auto isEligible = [&](const ReplicaStatus& status) {
             bool fresh = (now - status.lastSeen) <= m_staleAfter;
-            bool caughtUp = status.lastAppliedSeq + m_lagTolerance >= maxSeq;
+            bool caughtUp = status.lastAppliedSeq >= lagFloor;
             return fresh && caughtUp;
         };
 
@@ -117,7 +138,15 @@ private:
 
     uint16_t m_listenPort;
     std::chrono::milliseconds m_staleAfter;
-    uint64_t m_lagTolerance;
+    std::chrono::milliseconds m_lagWindow;
+
+    // The highest lastAppliedSeq across replicas, sampled at every
+    // recompute, oldest first. Single-writer (serveLoop thread only).
+    struct MaxSeqSample {
+        std::chrono::steady_clock::time_point when;
+        uint64_t maxSeq;
+    };
+    std::deque<MaxSeqSample> m_maxSeqHistory;
 
     int m_socket = -1;
     std::atomic<bool> m_running{ false };

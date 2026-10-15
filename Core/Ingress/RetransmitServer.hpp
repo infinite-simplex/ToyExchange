@@ -2,17 +2,31 @@
 #include <thread>
 #include <atomic>
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
+#include <system_error>
+#include <vector>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include "NetworkConfig.hpp"
 #include "SequenceStore.hpp"
 #include "RetransmitMessage.hpp"
 
+// Answers gap-fill requests from MulticastIngressReceiver. A request names a
+// start sequence and a count; the reply is a few datagrams, each holding a
+// RetransmitReplyHeader and as many whole records as fit in maxDatagramBytes
+// (see RetransmitMessage.hpp). The datagram size limit is the same
+// NetworkConfig::ingressDatagramMaxBytes the gateway uses for its fan-out,
+// so pass the same value when it is not the default.
 template <typename TCommand>
 class RetransmitServer {
 public:
-    RetransmitServer(SequenceStore<TCommand>& store, uint16_t listenPort)
-        : m_store(store), m_listenPort(listenPort) {
+    RetransmitServer(SequenceStore<TCommand>& store, uint16_t listenPort,
+        size_t maxDatagramBytes = DEFAULT_DATAGRAM_MAX_BYTES)
+        : m_store(store), m_listenPort(listenPort),
+          m_recordsPerDatagram(RecordsPerDatagram<TCommand>(maxDatagramBytes, sizeof(RetransmitReplyHeader))),
+          m_packet(sizeof(RetransmitReplyHeader) + m_recordsPerDatagram * sizeof(SequencedInboundMessage<TCommand>)) {
     }
 
     ~RetransmitServer() { stop(); }
@@ -43,6 +57,8 @@ public:
     }
 
 private:
+    using Message = SequencedInboundMessage<TCommand>;
+
     static constexpr uint32_t MAX_BATCH = 500; // caps worst-case work per request
 
     void serveLoop() {
@@ -58,33 +74,50 @@ private:
 
             RetransmitRequest req;
             std::memcpy(&req, reqBuf, sizeof(req));
-            uint32_t count = std::min(req.count, MAX_BATCH);
+            reply(req.startSeq, std::min(req.count, MAX_BATCH), fromAddr, fromLen);
+        }
+    }
 
-            for (uint32_t i = 0; i < count; ++i) {
-                uint64_t seq = req.startSeq + i;
-                SequencedInboundMessage<TCommand> record;
-                auto result = m_store.read(seq, record);
+    // Sends records startSeq .. startSeq+count-1, a datagram at a time. When a
+    // record is not available it sends the records before it, then one status
+    // datagram naming that record, and stops: the rest of the range is equally
+    // unavailable either way.
+    void reply(uint64_t startSeq, uint32_t count, const sockaddr_in& to, socklen_t toLen) {
+        uint32_t next = 0;
+        while (next < count) {
+            uint32_t inPacket = 0;
+            auto stopped = SequenceStore<TCommand>::ReadResult::OK;
 
-                if (result == SequenceStore<TCommand>::ReadResult::OK) {
-                    RetransmitRecordHeader hdr{ RetransmitStatus::OK, {}, seq };
-                    char packet[sizeof(hdr) + sizeof(record)];
-                    std::memcpy(packet, &hdr, sizeof(hdr));
-                    std::memcpy(packet + sizeof(hdr), &record, sizeof(record));
-                    sendto(m_socket, packet, sizeof(packet), 0, (sockaddr*)&fromAddr, fromLen);
-                }
-                else {
-                    auto status = (result == SequenceStore<TCommand>::ReadResult::TOO_OLD)
-                        ? RetransmitStatus::TOO_OLD : RetransmitStatus::NOT_YET_ARRIVED;
-                    RetransmitRecordHeader hdr{ status, {}, seq };
-                    sendto(m_socket, &hdr, sizeof(hdr), 0, (sockaddr*)&fromAddr, fromLen);
-                    break; // rest of the batch is equally unavailable either way
-                }
+            while (inPacket < m_recordsPerDatagram && next < count) {
+                Message record;
+                stopped = m_store.read(startSeq + next, record);
+                if (stopped != SequenceStore<TCommand>::ReadResult::OK) break;
+                std::memcpy(m_packet.data() + sizeof(RetransmitReplyHeader) + inPacket * sizeof(Message),
+                    &record, sizeof(record));
+                ++inPacket;
+                ++next;
+            }
+
+            if (inPacket > 0) {
+                RetransmitReplyHeader hdr{ RetransmitStatus::OK, {}, inPacket, startSeq + next - inPacket };
+                std::memcpy(m_packet.data(), &hdr, sizeof(hdr));
+                sendto(m_socket, m_packet.data(), sizeof(hdr) + inPacket * sizeof(Message), 0,
+                    (const sockaddr*)&to, toLen);
+            }
+            if (stopped != SequenceStore<TCommand>::ReadResult::OK) {
+                const auto status = (stopped == SequenceStore<TCommand>::ReadResult::TOO_OLD)
+                    ? RetransmitStatus::TOO_OLD : RetransmitStatus::NOT_YET_ARRIVED;
+                RetransmitReplyHeader hdr{ status, {}, 0, startSeq + next };
+                sendto(m_socket, &hdr, sizeof(hdr), 0, (const sockaddr*)&to, toLen);
+                return;
             }
         }
     }
 
     SequenceStore<TCommand>& m_store;
     uint16_t m_listenPort;
+    size_t m_recordsPerDatagram;
+    std::vector<char> m_packet; // one reply datagram, reused; serve thread only
     int m_socket = -1;
     std::atomic<bool> m_running{ false };
     std::thread m_thread;

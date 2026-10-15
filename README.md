@@ -31,6 +31,25 @@ dependency rather than living inside it.
 Design rationale and tradeoffs are written up in the
 [Toy Exchange Core design write-up](https://infinite-simplex.github.io/InfiniteLabs/#ToyExchangeCore).
 
+## What a product must provide
+
+Every replica applies the same sequenced command stream to its own engine,
+so a product's engine must be **deterministic**: the same commands, applied
+in order from sequence 0, give the same state and the same events on every
+replica. Core relies on this for replay (late join and restart) and for
+failover without any hand-over of state. In practice:
+
+- Nothing that affects state depends on hash-container order, pointer values
+  or randomness.
+- Nothing that affects state depends on a floating-point result that can
+  differ between hosts.
+- A clock reading may stamp an emitted event. It must never feed back into
+  state.
+- The command stream is the only input. Anything that must affect every
+  replica (a timed cancel, a batch clear) enters through the gateway as a
+  sequenced command and does not fire locally.
+- A command that makes the engine throw must throw on every replica.
+
 ## Building and running
 
 Linux only (uses `epoll`, `mmap`, multicast sockets, `CLOCK_TAI` directly —
@@ -50,11 +69,13 @@ ctest --test-dir build --output-on-failure
 ```
 
 Core primitives only: replica arbitration, telemetry, performance
-aggregation, and the ingress recovery path (sequence store, retransmit
-server, multicast receiver — late join, restart, duplicates, lost tails),
-tested with a stand-in command type. A product repo carries its own tests
-for whatever it builds on top (matching engine, wire protocol, the gateway
-end to end). CI runs this on every push.
+aggregation, the ingress recovery path (sequence store, retransmit server,
+multicast receiver — late join, restart, duplicates, lost tails, damaged
+retransmit replies), and the ingress gateway with a stand-in wire protocol
+(sequencing, store-before-multicast, datagram batching, split and broken
+frames). The tests use a stand-in command type. A product repo carries its
+own tests for whatever it builds on top (matching engine, real wire
+protocol). CI runs this on every push.
 
 ## License
 

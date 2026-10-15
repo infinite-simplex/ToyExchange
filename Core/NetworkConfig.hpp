@@ -1,5 +1,13 @@
 #pragma once
+#include <cstddef>
+#include <cstdint>
 #include <string>
+
+// Default payload limit for one datagram on the ingress path. A datagram this
+// size fits a 1500-byte Ethernet MTU with room for the IP and UDP headers, so
+// the network never fragments it. Used by NetworkConfig and, as the default of
+// its constructor, by RetransmitServer.
+inline constexpr size_t DEFAULT_DATAGRAM_MAX_BYTES = 1400;
 
 struct NetworkConfig {
     // Inbound order-entry configuration — whatever wire protocol the
@@ -30,6 +38,27 @@ struct NetworkConfig {
     // for the next live command. false = only a live datagram that reveals a
     // sequence gap triggers recovery.
     bool ingressIdleProbe = true;
+
+    // NetworkGateway sends every command it parsed in one epoll round as a few
+    // datagrams of back-to-back records, not one datagram per command. A datagram
+    // holds as many whole records as fit in this many bytes (at least one).
+    // Waking a receiver costs the sender the same whatever the datagram size, so
+    // more records per datagram means more commands per second. Keep it at or
+    // below the path MTU minus 28 bytes, or the network fragments the datagram
+    // and one lost fragment loses every record in it. On a single host, where
+    // the path MTU is 65,536, a larger value is safe.
+    size_t ingressDatagramMaxBytes = DEFAULT_DATAGRAM_MAX_BYTES;
+
+    // Receiver spin window, in microseconds. 0 (the default) means
+    // MulticastIngressReceiver blocks in recv() between datagrams. A value N
+    // above 0 means that after each datagram it polls the socket for up to N
+    // microseconds before it blocks again. A sleeping receiver costs a
+    // co-located sender a wake-up for every datagram, so a product that must
+    // sustain a very high command rate with several replicas on one host can
+    // turn this on (50 to 100 is a good start). The price is one busy thread per
+    // replica for as long as traffic keeps arriving. An idle receiver never
+    // spins.
+    uint32_t ingressSpinMicros = 0;
 
     // Kernel receive buffer that MulticastIngressReceiver asks for, on both the
     // multicast socket and the retransmit-reply socket. The Linux default is

@@ -75,6 +75,10 @@ void NetworkGateway<TProtocolHandler, TCommand>::start() {
     m_mcastDestAddr.sin_port = htons(m_config.multicastPort);
     inet_pton(AF_INET, m_config.multicastIp.c_str(), &m_mcastDestAddr.sin_addr);
 
+    m_recordsPerDatagram = RecordsPerDatagram<TCommand>(m_config.ingressDatagramMaxBytes);
+    m_batch.clear();
+    m_batch.reserve(m_recordsPerDatagram);
+
     m_running.store(true);
     m_ingressThread = std::thread(&NetworkGateway::pollSockets, this);
 }
@@ -170,13 +174,30 @@ void NetworkGateway<TProtocolHandler, TCommand>::pollSockets() {
                 msg.clientSessionId = cmd.sessionId;
                 msg.command = cmd;
                 m_sequenceStore.append(msg); // append before multicast — closes the durability gap
-                sendto(m_mcastFd, &msg, sizeof(msg), 0,
-                    (struct sockaddr*)&m_mcastDestAddr, sizeof(m_mcastDestAddr));
+                m_batch.push_back(msg);
+                if (m_batch.size() == m_recordsPerDatagram) flushBatch();
 
                 connBuf.consume(consumed);
             }
         }
+
+        // One datagram for everything this round sequenced, however many
+        // connections it came from. Nothing waits for a datagram to fill: at a
+        // low rate this is one record per datagram, and the batch grows only
+        // as fast as commands arrive.
+        flushBatch();
     }
+}
+
+template <typename TProtocolHandler, typename TCommand>
+void NetworkGateway<TProtocolHandler, TCommand>::flushBatch() {
+    if (m_batch.empty()) return;
+    // A failed send loses no command: every record is already in the store,
+    // so each replica sees the gap and fetches the records through the
+    // retransmit server.
+    sendto(m_mcastFd, m_batch.data(), m_batch.size() * sizeof(m_batch[0]), 0,
+        (struct sockaddr*)&m_mcastDestAddr, sizeof(m_mcastDestAddr));
+    m_batch.clear();
 }
 
 template <typename TProtocolHandler, typename TCommand>

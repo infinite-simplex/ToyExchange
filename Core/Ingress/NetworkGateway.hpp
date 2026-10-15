@@ -35,6 +35,13 @@ struct ConnectionBuffer {
 // TProtocolHandler::PARSE_FATAL_ERROR if a complete frame was received but
 // is structurally uninterpretable — NetworkGateway closes the connection in
 // that case rather than stalling on bytes that will never parse.
+//
+// Fan-out batching: the commands sequenced in one pass of the ingress loop
+// leave as one multicast datagram of back-to-back records (at most
+// NetworkConfig::ingressDatagramMaxBytes), sent at the end of that pass or as
+// soon as the datagram is full. Nothing ever waits for more commands to
+// arrive, so a command that arrives alone goes out at once, in a datagram of
+// one record. Every record is appended to the store before its datagram is sent.
 template <typename TProtocolHandler, typename TCommand>
 class NetworkGateway {
 public:
@@ -72,6 +79,9 @@ public:
 
 private:
     void pollSockets();
+    // Multicasts the records collected so far as one datagram and empties the
+    // batch. Every record in it is already in the sequence store.
+    void flushBatch();
     // Full teardown for one connection: stop polling its fd, close it, and
     // erase every piece of per-connection state. The single canonical place
     // this happens — called both when recv() reports the peer is gone and
@@ -94,6 +104,11 @@ private:
     char m_readBuffer[BUFFER_SIZE];
 
     uint64_t m_sequenceNumber = 0; // single-writer (ingress thread only)
+
+    // Records sequenced in the current epoll round, waiting to go out as one
+    // datagram. Ingress thread only. Capacity is fixed in start().
+    std::vector<SequencedInboundMessage<TCommand>> m_batch;
+    size_t m_recordsPerDatagram = 1;
     std::unordered_map<int, ConnectionBuffer> m_connBuffers;
 
     // Session bookkeeping for egress routing (see sendToSession above).

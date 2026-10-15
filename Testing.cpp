@@ -132,6 +132,72 @@ TEST(ReplicaArbiterTest, LowestIdWinsAmongEligibleCandidatesOnFailover) {
 
     arbiter.stop();
 }
+
+// Applies commands at `rate` per second since `start`, plus `extra`.
+static uint64_t AppliedSeqAt(std::chrono::steady_clock::time_point start, uint64_t rate, uint64_t extra) {
+    const auto elapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    return static_cast<uint64_t>(elapsedUs) * rate / 1'000'000 + extra;
+}
+
+TEST(ReplicaArbiterTest, HealthyReplicasThatReportAtDifferentMomentsDoNotDemoteTheLeaderAtAHighRate) {
+    // Both replicas apply 500,000 commands/s. Replica 2 always reports 1,000
+    // commands ahead of replica 1, as it would if its heartbeat fell 2 ms later
+    // in the cycle. Replica 1 is not behind in any real sense. A fixed tolerance
+    // of 200 commands demotes it here.
+    constexpr uint64_t RATE = 500'000;
+    ReplicaArbiter arbiter(46005, std::chrono::milliseconds(100), std::chrono::milliseconds(20));
+    arbiter.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    const auto start = std::chrono::steady_clock::now();
+    const auto first = SendHeartbeat(46005, 1, AppliedSeqAt(start, RATE, 0));
+    ASSERT_EQ(ReplicaId(1), first.leaderId);
+
+    for (int round = 0; round < 25; ++round) { // about 100 ms: several lag windows
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        const auto fromTwo = SendHeartbeat(46005, 2, AppliedSeqAt(start, RATE, 1'000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        const auto fromOne = SendHeartbeat(46005, 1, AppliedSeqAt(start, RATE, 0));
+
+        ASSERT_EQ(ReplicaId(1), fromTwo.leaderId) << "round " << round;
+        ASSERT_EQ(ReplicaId(1), fromOne.leaderId) << "round " << round;
+        ASSERT_EQ(first.epoch, fromOne.epoch) << "the leader changed in round " << round;
+    }
+
+    arbiter.stop();
+}
+
+TEST(ReplicaArbiterTest, LeaderThatStopsAdvancingLosesLeadershipOnceItIsAFullLagWindowBehind) {
+    // Replica 1 leads, then freezes at sequence 100 while it keeps heartbeating:
+    // alive and fresh, but stuck. Replica 2 keeps applying 100,000 commands/s.
+    constexpr uint64_t RATE = 100'000;
+    constexpr auto LAG_WINDOW = std::chrono::milliseconds(40);
+    ReplicaArbiter arbiter(46006, std::chrono::milliseconds(200), LAG_WINDOW);
+    arbiter.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    const auto start = std::chrono::steady_clock::now();
+    const auto first = SendHeartbeat(46006, 1, 100);
+    ASSERT_EQ(ReplicaId(1), first.leaderId);
+
+    HeartbeatResponse latest = first;
+    bool demotedWithinTheWindow = false;
+    for (int round = 0; round < 40; ++round) { // about 120 ms: three lag windows
+        std::this_thread::sleep_for(std::chrono::milliseconds(3));
+        SendHeartbeat(46006, 1, 100);
+        latest = SendHeartbeat(46006, 2, 100 + AppliedSeqAt(start, RATE, 0));
+        if (latest.leaderId != ReplicaId(1) && std::chrono::steady_clock::now() - start < LAG_WINDOW / 2) {
+            demotedWithinTheWindow = true;
+        }
+    }
+
+    EXPECT_FALSE(demotedWithinTheWindow) << "a replica must be behind for a whole window before it loses leadership";
+    EXPECT_EQ(ReplicaId(2), latest.leaderId);
+    EXPECT_GT(latest.epoch, first.epoch);
+
+    arbiter.stop();
+}
 // =====================================================================
 // get_synced_time_ns() — cross-machine-comparable telemetry timestamps
 // =====================================================================

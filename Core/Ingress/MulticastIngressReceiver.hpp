@@ -8,8 +8,10 @@
 
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <thread>
+#include <vector>
 #include <cstring>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -20,8 +22,12 @@
 // Consumer side of NetworkGateway<TProtocolHandler, TCommand>'s UDP multicast
 // fan-out: receives the same SequencedInboundMessage<TCommand> wire struct
 // NetworkGateway builds and sends, detects sequence gaps, recovers them via
-// RetransmitServer<TCommand> (see RetransmitProtocol.hpp), and pushes each
+// RetransmitServer<TCommand> (see RetransmitMessage.hpp), and pushes each
 // TCommand into the local Orderbook Input Disruptor (SPSCQueue<TCommand>).
+//
+// One datagram carries one or more records back to back. The receiver runs
+// every record through the same checks, in order, so a datagram of ten records
+// behaves exactly like ten datagrams of one.
 //
 // Two things reveal that this replica is behind. A live datagram whose
 // sequence number is ahead of the one expected shows a gap in the middle of
@@ -43,6 +49,7 @@ public:
         if (m_running.load()) return;
 
         m_udpFd = socket(AF_INET, SOCK_DGRAM, 0);
+        m_rxBuffer.assign(MAX_DATAGRAM_BYTES, 0);
 
         int opt = 1;
         setsockopt(m_udpFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -99,6 +106,7 @@ public:
 private:
     using Message = SequencedInboundMessage<TCommand>;
 
+    static constexpr size_t MAX_DATAGRAM_BYTES = 65535; // largest UDP payload; the sender's ingressDatagramMaxBytes is at most this
     static constexpr uint32_t MAX_BATCH = 500; // must match RetransmitServer::MAX_BATCH
     static constexpr int MAX_ATTEMPTS = 3;     // per batch, when a live datagram revealed the gap
     static constexpr int PROBE_ATTEMPTS = 1;   // an idle probe simply runs again at the next timeout
@@ -116,35 +124,73 @@ private:
 
     void rxLoop() {
         uint64_t expectedSeq = 0; // matches NetworkGateway::m_sequenceNumber, which starts at 0
+        bool spin = false;        // only right after traffic; an idle receiver sleeps
 
         while (m_running.load(std::memory_order_relaxed)) {
-            Message msg{};
-            ssize_t len = recv(m_udpFd, &msg, sizeof(msg), 0);
+            const ssize_t len = receiveDatagram(spin);
 
             if (len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 // A full receive timeout with no datagram. If this replica
                 // missed the last datagrams before the sender went quiet, or
                 // has only just started, no later datagram will ever reveal
                 // that — so ask.
+                spin = false;
                 if (m_config.ingressIdleProbe && !probeForMissedTail(expectedSeq)) return;
                 continue;
             }
-            if (len < static_cast<ssize_t>(sizeof(Message))) {
-                continue; // Fragmented or faulty packet drop
+            if (len <= 0 || static_cast<size_t>(len) % sizeof(Message) != 0) {
+                continue; // Fragmented or faulty packet drop: a datagram is a whole number of records
             }
+
+            spin = true;
+            if (!applyDatagram(static_cast<size_t>(len), expectedSeq)) return;
+        }
+    }
+
+    // Reads one datagram into m_rxBuffer and returns its length, or -1 with
+    // errno set. Right after traffic, and only if NetworkConfig::ingressSpinMicros
+    // is set, it first polls without blocking for up to that long, so a
+    // sender that is already waiting does not have to wake this thread.
+    ssize_t receiveDatagram(bool spin) {
+        char* buffer = m_rxBuffer.data();
+        if (spin && m_config.ingressSpinMicros > 0) {
+            const auto deadline = std::chrono::steady_clock::now()
+                + std::chrono::microseconds(m_config.ingressSpinMicros);
+            do {
+                const ssize_t len = recv(m_udpFd, buffer, m_rxBuffer.size(), MSG_DONTWAIT);
+                if (len >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) return len;
+                _mm_pause();
+            } while (std::chrono::steady_clock::now() < deadline);
+        }
+        return recv(m_udpFd, buffer, m_rxBuffer.size(), 0);
+    }
+
+    // Runs every record in the datagram through the same checks, in order.
+    // Returns false when the receiver must stop: an unrecoverable gap, or
+    // shutdown while the queue was full.
+    bool applyDatagram(size_t length, uint64_t& expectedSeq) {
+        const size_t count = length / sizeof(Message);
+        uint64_t ignored = 0;
+        uint64_t firstIgnoredSeq = 0;
+        uint64_t expectedAtFirstIgnore = 0;
+
+        for (size_t i = 0; i < count; ++i) {
+            Message msg{};
+            std::memcpy(&msg, m_rxBuffer.data() + i * sizeof(Message), sizeof(Message));
 
             // Delivery is strictly in order from 0, so everything below
             // expectedSeq has already been delivered exactly once. An older
-            // datagram is therefore a copy of something already applied: a
+            // record is therefore a copy of something already applied: a
             // network duplicate, a late reordered packet, or a live datagram
             // that a retransmit reached first. Applying it again would apply
             // the command twice. (It is also what a restarted gateway looks
             // like, since its sequence starts again at 0 — replicas must be
             // restarted along with the gateway.)
             if (msg.sequenceNumber < expectedSeq) {
-                std::cerr << "[WARNING] Ignoring already-delivered datagram. Expected: "
-                    << expectedSeq << " Got: " << msg.sequenceNumber
-                    << " (network duplicate, or the gateway restarted)\n";
+                if (ignored++ == 0) {
+                    firstIgnoredSeq = msg.sequenceNumber;
+                    expectedAtFirstIgnore = expectedSeq;
+                }
                 continue;
             }
 
@@ -169,14 +215,21 @@ private:
                         << msg.sequenceNumber << "); this replica's book is permanently "
                         << "incomplete, stopping.\n";
                     m_hitUnrecoverableGap.store(true, std::memory_order_relaxed);
-                    return;
+                    return false;
                 }
                 expectedSeq = msg.sequenceNumber;
             }
             expectedSeq++;
 
-            pushWithTelemetry(msg);
+            if (!pushWithTelemetry(msg)) return false;
         }
+
+        if (ignored > 0) {
+            std::cerr << "[WARNING] Ignoring " << ignored << " already-delivered record(s). Expected: "
+                << expectedAtFirstIgnore << " First ignored: " << firstIgnoredSeq
+                << " (network duplicate, or the gateway restarted)\n";
+        }
+        return true;
     }
 
     // Asks the retransmit server for everything from expectedSeq onward and
@@ -240,16 +293,18 @@ private:
     // no longer holds a record (Evicted); neither answer changes on a retry,
     // so neither is retried. A silent or partial reply is retried up to
     // maxAttempts times per batch, each retry asking only for the records
-    // still missing so none is pushed twice. Each reply carries its sequence
-    // number, and only the reply for the next missing record is used, so a
-    // lost, duplicated or stale datagram can never take another record's place.
+    // still missing so none is pushed twice. Each reply datagram names the
+    // sequence numbers it holds, and only the records from the next missing one
+    // onward are used, so a lost, duplicated, stale or partly stale datagram
+    // can never take another record's place.
     FetchResult fetchRange(uint64_t startSeq, uint64_t count, int maxAttempts) {
         int sock = socket(AF_INET, SOCK_DGRAM, 0);
         if (sock < 0) return { FetchOutcome::Unavailable, 0 };
 
-        // The server sends a batch of up to 500 datagrams back to back, and
+        // The server sends a batch of up to 500 records back to back, and
         // this thread stops reading while the inbound queue is full.
         SetReceiveBuffer(sock, m_config.ingressReceiveBufferBytes);
+        std::vector<char> reply(MAX_DATAGRAM_BYTES); // one reply datagram at a time
 
         timeval timeout{};
         timeout.tv_sec = 0;
@@ -285,47 +340,49 @@ private:
                 }
 
                 while (received < batch) {
-                    char packet[sizeof(RetransmitRecordHeader) + sizeof(Message)];
-                    ssize_t n = recv(sock, packet, sizeof(packet), 0);
-                    if (n < static_cast<ssize_t>(sizeof(RetransmitRecordHeader))) {
+                    const ssize_t n = recv(sock, reply.data(), reply.size(), 0);
+                    if (n < static_cast<ssize_t>(sizeof(RetransmitReplyHeader))) {
                         break; // timeout or malformed response — retry the rest of the batch
                     }
 
-                    RetransmitRecordHeader hdr{};
-                    std::memcpy(&hdr, packet, sizeof(hdr));
+                    RetransmitReplyHeader hdr{};
+                    std::memcpy(&hdr, reply.data(), sizeof(hdr));
 
-                    // A reply counts only if it answers the sequence number
-                    // still missing. A later one means the reply for seq was
-                    // lost. An earlier one is a duplicate, or a stale reply
-                    // from an earlier attempt or batch on this socket. Ignore
-                    // both; the retry below resumes from seq.
-                    if (hdr.sequenceNumber != seq) continue;
-
-                    if (hdr.status == RetransmitStatus::TOO_OLD) {
-                        outcome = FetchOutcome::Evicted;
+                    // A reply counts only for the record still missing (seq).
+                    // A datagram that starts later means the one holding seq
+                    // was lost. A datagram that ends earlier is a duplicate,
+                    // or a stale reply from an earlier attempt or batch on
+                    // this socket. Ignore both; the retry below resumes from
+                    // seq. A datagram that covers seq and also older records
+                    // is used from seq onward.
+                    if (hdr.status != RetransmitStatus::OK) {
+                        if (hdr.firstSequence != seq) continue;
+                        outcome = (hdr.status == RetransmitStatus::TOO_OLD)
+                            ? FetchOutcome::Evicted : FetchOutcome::ReachedTail;
                         definitive = true;
                         break;
                     }
-                    if (hdr.status == RetransmitStatus::NOT_YET_ARRIVED) {
-                        outcome = FetchOutcome::ReachedTail;
-                        definitive = true;
-                        break;
+                    if (hdr.count == 0 ||
+                        static_cast<size_t>(n) != sizeof(hdr) + static_cast<size_t>(hdr.count) * sizeof(Message)) {
+                        continue; // malformed or truncated — not usable
                     }
-                    if (n != static_cast<ssize_t>(sizeof(packet))) {
-                        break; // truncated record — retry the rest of the batch
+                    if (hdr.firstSequence > seq) continue;
+                    if (hdr.firstSequence + hdr.count <= seq) continue;
+
+                    for (uint64_t i = seq - hdr.firstSequence; i < hdr.count && received < batch; ++i) {
+                        Message record{};
+                        std::memcpy(&record, reply.data() + sizeof(hdr) + i * sizeof(Message), sizeof(record));
+
+                        if (!pushWithTelemetry(record)) {
+                            outcome = FetchOutcome::Unavailable;
+                            definitive = true;
+                            break;
+                        }
+
+                        ++seq;
+                        ++received;
                     }
-
-                    Message record{};
-                    std::memcpy(&record, packet + sizeof(hdr), sizeof(record));
-
-                    if (!pushWithTelemetry(record)) {
-                        outcome = FetchOutcome::Unavailable;
-                        definitive = true;
-                        break;
-                    }
-
-                    ++seq;
-                    ++received;
+                    if (definitive) break;
                 }
             }
 
@@ -346,6 +403,7 @@ private:
     std::atomic<bool> m_running{ false };
     std::thread m_worker;
     int m_udpFd{ -1 };
+    std::vector<char> m_rxBuffer; // one datagram, up to the largest UDP payload
     int m_receiveBufferBytes{ 0 };
     std::atomic<bool> m_hitUnrecoverableGap{ false };
 };
