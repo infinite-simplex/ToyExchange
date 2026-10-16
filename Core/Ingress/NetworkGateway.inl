@@ -123,7 +123,7 @@ void NetworkGateway<TProtocolHandler, TCommand, TFanOut>::pollSockets() {
                     m_fdToSession[clientSocket] = sessionId;
                     {
                         std::lock_guard<std::mutex> lock(m_sessionMutex);
-                        m_sessionToFd[sessionId] = clientSocket;
+                        m_sessionOutput[sessionId].fd = clientSocket;
                     }
                 }
                 continue;
@@ -201,7 +201,11 @@ void NetworkGateway<TProtocolHandler, TCommand, TFanOut>::closeConnection(int fd
     auto sessionIt = m_fdToSession.find(fd);
     if (sessionIt != m_fdToSession.end()) {
         std::lock_guard<std::mutex> lock(m_sessionMutex);
-        m_sessionToFd.erase(sessionIt->second);
+        auto output = m_sessionOutput.find(sessionIt->second);
+        if (output != m_sessionOutput.end()) {
+            if (output->second.counted) m_sessionsWithPending.fetch_sub(1, std::memory_order_relaxed);
+            m_sessionOutput.erase(output);
+        }
         m_fdToSession.erase(sessionIt);
     }
 }

@@ -4,6 +4,7 @@
 #include "RetransmitMessage.hpp"
 #include "NetworkConfig.hpp"
 #include "ReceiveBuffer.hpp"
+#include "SpinReceive.hpp"
 #include "InboundQueueWriter.hpp"
 #include "Telemetry.hpp"
 
@@ -50,7 +51,7 @@ public:
         if (m_running.load()) return;
 
         m_udpFd = socket(AF_INET, SOCK_DGRAM, 0);
-        m_rxBuffer.assign(MAX_DATAGRAM_BYTES, 0);
+        m_rxBuffer.assign(MAX_UDP_PAYLOAD_BYTES, 0);
 
         int opt = 1;
         setsockopt(m_udpFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -107,7 +108,6 @@ public:
 private:
     using Message = SequencedInboundMessage<TCommand>;
 
-    static constexpr size_t MAX_DATAGRAM_BYTES = 65535; // largest UDP payload; the sender's ingressDatagramMaxBytes is at most this
     static constexpr uint32_t MAX_BATCH = 500; // must match RetransmitServer::MAX_BATCH
     static constexpr int MAX_ATTEMPTS = 3;     // per batch, when a live datagram revealed the gap
     static constexpr int PROBE_ATTEMPTS = 1;   // an idle probe simply runs again at the next timeout
@@ -153,17 +153,7 @@ private:
     // is set, it first polls without blocking for up to that long, so a
     // sender that is already waiting does not have to wake this thread.
     ssize_t receiveDatagram(bool spin) {
-        char* buffer = m_rxBuffer.data();
-        if (spin && m_config.ingressSpinMicros > 0) {
-            const auto deadline = std::chrono::steady_clock::now()
-                + std::chrono::microseconds(m_config.ingressSpinMicros);
-            do {
-                const ssize_t len = recv(m_udpFd, buffer, m_rxBuffer.size(), MSG_DONTWAIT);
-                if (len >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) return len;
-                _mm_pause();
-            } while (std::chrono::steady_clock::now() < deadline);
-        }
-        return recv(m_udpFd, buffer, m_rxBuffer.size(), 0);
+        return ReceiveDatagram(m_udpFd, m_rxBuffer.data(), m_rxBuffer.size(), spin, m_config.ingressSpinMicros);
     }
 
     // Runs every record in the datagram through the same checks, in order.
@@ -275,7 +265,7 @@ private:
         // The server sends a batch of up to 500 records back to back, and
         // this thread stops reading while the inbound queue is full.
         SetReceiveBuffer(sock, m_config.ingressReceiveBufferBytes);
-        std::vector<char> reply(MAX_DATAGRAM_BYTES); // one reply datagram at a time
+        std::vector<char> reply(MAX_UDP_PAYLOAD_BYTES); // one reply datagram at a time
 
         timeval timeout{};
         timeout.tv_sec = 0;

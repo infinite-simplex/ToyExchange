@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <cerrno>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -74,16 +75,72 @@ public:
     // NetworkGateway that isn't single-threaded-by-design. Returns false with
     // no error if that session has since disconnected (a stale/aged-out
     // sessionId is a safe no-op here, unlike a raw fd lookup would be).
+    //
+    // `data` should be whole frames. A client's socket may take only part of
+    // a call, or none of it. The rest is kept, and goes out before anything
+    // newer, so the client's stream stays in order and no frame is ever cut by
+    // the one after it. If the client falls so far behind that more than
+    // NetworkConfig::sessionOutboundBufferBytes is waiting, a new call is
+    // dropped whole and counted (droppedOutputBytes), never cut mid-frame.
     bool sendToSession(SessionId id, const char* data, size_t len) {
-        int fd = -1;
-        {
-            std::lock_guard<std::mutex> lock(m_sessionMutex);
-            auto it = m_sessionToFd.find(id);
-            if (it == m_sessionToFd.end()) return false;
-            fd = it->second;
+        std::lock_guard<std::mutex> lock(m_sessionMutex);
+        auto it = m_sessionOutput.find(id);
+        if (it == m_sessionOutput.end()) return false;
+        SessionOutput& session = it->second;
+
+        if (!session.pending.empty()) {
+            if (!drainPending(session)) return false;
+            if (!session.pending.empty()) {
+                // Still backed up: queue behind the older output, within the limit.
+                if (session.pending.size() + len > m_config.sessionOutboundBufferBytes) {
+                    m_droppedOutputBytes.fetch_add(len, std::memory_order_relaxed);
+                    return false;
+                }
+                session.pending.append(data, len);
+                return true;
+            }
+            trackPending(session);
         }
-        return send(fd, data, len, MSG_NOSIGNAL) >= 0;
+
+        // Nothing waiting: write straight away. What the socket does not take must be kept,
+        // whatever the limit, because dropping the rest of a frame already begun would corrupt the stream.
+        size_t sent = 0;
+        while (sent < len) {
+            const ssize_t n = send(session.fd, data + sent, len - sent, MSG_NOSIGNAL);
+            if (n > 0) { sent += static_cast<size_t>(n); continue; }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+            return false; // the peer is gone; the ingress thread closes the connection when it notices
+        }
+        if (sent < len) {
+            session.pending.assign(data + sent, len - sent);
+            trackPending(session);
+        }
+        return true;
     }
+
+    // Gives every client with output waiting another chance to take it. EgressGateway calls this after each
+    // batch and while it is idle, so a slow client catches up even when no new output arrives for it.
+    void flushPendingSessions() {
+        if (m_sessionsWithPending.load(std::memory_order_relaxed) == 0) return;
+        std::lock_guard<std::mutex> lock(m_sessionMutex);
+        for (auto& entry : m_sessionOutput) {
+            SessionOutput& session = entry.second;
+            if (session.pending.empty()) continue;
+            drainPending(session);
+            trackPending(session);
+        }
+    }
+
+    // Output bytes that a client's socket has not yet taken, over all clients.
+    size_t pendingOutputBytes() const {
+        std::lock_guard<std::mutex> lock(m_sessionMutex);
+        size_t total = 0;
+        for (const auto& entry : m_sessionOutput) total += entry.second.pending.size();
+        return total;
+    }
+
+    // Bytes of output dropped because a client was too far behind. See sendToSession.
+    uint64_t droppedOutputBytes() const { return m_droppedOutputBytes.load(std::memory_order_relaxed); }
 
 private:
     void pollSockets();
@@ -95,6 +152,35 @@ private:
     // this happens — called both when recv() reports the peer is gone and
     // when validateAndParse reports a structurally-broken frame.
     void closeConnection(int fd);
+
+    // One client's private output: its socket, and the bytes the socket has not yet taken.
+    struct SessionOutput {
+        int fd = -1;
+        std::string pending;     // oldest first
+        bool counted = false;    // included in m_sessionsWithPending
+    };
+
+    // Writes as much of the client's waiting output as its socket takes. Returns false if the peer is gone.
+    // m_sessionMutex must be held.
+    bool drainPending(SessionOutput& session) {
+        while (!session.pending.empty()) {
+            const ssize_t n = send(session.fd, session.pending.data(), session.pending.size(), MSG_NOSIGNAL);
+            if (n > 0) { session.pending.erase(0, static_cast<size_t>(n)); continue; }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
+            return false;
+        }
+        return true;
+    }
+
+    // Keeps m_sessionsWithPending right, so flushPendingSessions() costs nothing when no client is behind.
+    // m_sessionMutex must be held.
+    void trackPending(SessionOutput& session) {
+        const bool behind = !session.pending.empty();
+        if (behind == session.counted) return;
+        session.counted = behind;
+        if (behind) m_sessionsWithPending.fetch_add(1, std::memory_order_relaxed);
+        else m_sessionsWithPending.fetch_sub(1, std::memory_order_relaxed);
+    }
 
     TProtocolHandler& m_protocolHandler;
     NetworkConfig       m_config;
@@ -120,13 +206,16 @@ private:
 
     // Session bookkeeping for egress routing (see sendToSession above).
     // m_nextSessionId/m_fdToSession are ingress-thread-only, same as
-    // m_connBuffers. m_sessionToFd is the only piece read from another
+    // m_connBuffers. m_sessionOutput is the only piece used from another
     // thread (EgressGateway's), hence the separate mutex — kept off the
-    // lock-free ingress hot path entirely.
+    // lock-free ingress hot path entirely. The ingress thread takes it only
+    // when a client connects or leaves.
     SessionId m_nextSessionId{ 1 };
     std::unordered_map<int, SessionId> m_fdToSession;
-    std::mutex m_sessionMutex;
-    std::unordered_map<SessionId, int> m_sessionToFd;
+    mutable std::mutex m_sessionMutex;
+    std::unordered_map<SessionId, SessionOutput> m_sessionOutput;
+    std::atomic<size_t> m_sessionsWithPending{ 0 };
+    std::atomic<uint64_t> m_droppedOutputBytes{ 0 };
 };
 
 #include "NetworkGateway.inl" // template implementation, see below

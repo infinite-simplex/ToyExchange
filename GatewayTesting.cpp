@@ -372,3 +372,146 @@ TEST(GatewayTest, ACommandThatArrivesAloneIsSentAtOnceAndNeverWaitsForOthers) {
     close(client);
     gateway.stop();
 }
+
+// =====================================================================
+// Private output to a client that cannot keep up
+// =====================================================================
+
+namespace {
+
+int ConnectWithReceiveBuffer(uint16_t tcpPort, int receiveBufferBytes) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receiveBufferBytes, sizeof(receiveBufferBytes)); // before connect, so it sticks
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(tcpPort);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    if (connect(fd, (sockaddr*)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+constexpr size_t OUTPUT_FRAME_BYTES = 1024;
+
+// A frame that can be checked: a counter, then bytes derived from it.
+std::string MakeOutputFrame(uint64_t counter) {
+    std::string frame(OUTPUT_FRAME_BYTES, '\0');
+    std::memcpy(frame.data(), &counter, sizeof(counter));
+    for (size_t i = sizeof(counter); i < frame.size(); ++i) frame[i] = static_cast<char>((counter + i) & 0xFF);
+    return frame;
+}
+
+bool FrameIsIntact(const char* bytes, uint64_t& counter) {
+    std::memcpy(&counter, bytes, sizeof(counter));
+    for (size_t i = sizeof(counter); i < OUTPUT_FRAME_BYTES; ++i) {
+        if (bytes[i] != static_cast<char>((counter + i) & 0xFF)) return false;
+    }
+    return true;
+}
+
+// Reads from `client` until the gateway has nothing left to flush and the socket has gone quiet,
+// asking the gateway to flush as it goes, as EgressGateway does.
+std::vector<char> ReadEverything(int client, TestGateway& gateway) {
+    std::vector<char> got;
+    std::vector<char> buffer(64 * 1024);
+    auto quietSince = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - quietSince < std::chrono::milliseconds(500)) {
+        gateway.flushPendingSessions();
+        const ssize_t n = recv(client, buffer.data(), buffer.size(), MSG_DONTWAIT);
+        if (n > 0) {
+            got.insert(got.end(), buffer.begin(), buffer.begin() + n);
+            quietSince = std::chrono::steady_clock::now();
+        }
+        else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    return got;
+}
+
+} // namespace
+
+TEST(GatewayTest, OutputForAClientThatIsNotReadingIsKeptWholeAndInOrder) {
+    constexpr uint64_t FRAMES = 12'000; // 12 MB: more than a loopback socket buffer holds
+    NetworkConfig config = GatewayConfig("239.255.1.47", 25247, 47017);
+    config.sessionOutboundBufferBytes = 64 * 1024 * 1024;
+    FixedFrameHandler handler;
+    TestGateway gateway(handler, config, FreshStorePath("slow_client_kept"), 1024);
+    gateway.start();
+
+    const int client = ConnectWithReceiveBuffer(47017, 4096);
+    ASSERT_GE(client, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(150)); // the first session id is 1
+
+    for (uint64_t n = 0; n < FRAMES; ++n) {
+        const std::string frame = MakeOutputFrame(n);
+        ASSERT_TRUE(gateway.sendToSession(1, frame.data(), frame.size())) << "frame " << n << " was refused";
+    }
+    EXPECT_GT(gateway.pendingOutputBytes(), 0u) << "the socket must have been full, or this test proves nothing";
+
+    const std::vector<char> got = ReadEverything(client, gateway);
+    ASSERT_EQ(FRAMES * OUTPUT_FRAME_BYTES, got.size());
+    for (uint64_t n = 0; n < FRAMES; ++n) {
+        uint64_t counter = 0;
+        if (!FrameIsIntact(got.data() + n * OUTPUT_FRAME_BYTES, counter) || counter != n) {
+            ADD_FAILURE() << "frame " << n << " is cut, mixed with another, or out of order (found " << counter << ")";
+            break;
+        }
+    }
+    EXPECT_EQ(0u, gateway.pendingOutputBytes());
+    EXPECT_EQ(0u, gateway.droppedOutputBytes());
+
+    close(client);
+    gateway.stop();
+}
+
+TEST(GatewayTest, OutputBeyondTheLimitIsDroppedWholeAndCounted) {
+    constexpr uint64_t FRAMES = 12'000;
+    NetworkConfig config = GatewayConfig("239.255.1.48", 25248, 47018);
+    config.sessionOutboundBufferBytes = 64 * 1024;
+    FixedFrameHandler handler;
+    TestGateway gateway(handler, config, FreshStorePath("slow_client_dropped"), 1024);
+    gateway.start();
+
+    const int client = ConnectWithReceiveBuffer(47018, 4096);
+    ASSERT_GE(client, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    uint64_t refused = 0;
+    for (uint64_t n = 0; n < FRAMES; ++n) {
+        const std::string frame = MakeOutputFrame(n);
+        if (!gateway.sendToSession(1, frame.data(), frame.size())) ++refused;
+    }
+    ASSERT_GT(refused, 0u) << "the limit must have been reached, or this test proves nothing";
+    EXPECT_EQ(refused * OUTPUT_FRAME_BYTES, gateway.droppedOutputBytes()) << "a call is dropped whole";
+
+    const std::vector<char> got = ReadEverything(client, gateway);
+    ASSERT_EQ(0u, got.size() % OUTPUT_FRAME_BYTES) << "no frame may be cut short";
+    const uint64_t received = got.size() / OUTPUT_FRAME_BYTES;
+    EXPECT_EQ(FRAMES - refused, received) << "every call that was accepted must arrive";
+    uint64_t previous = 0;
+    for (uint64_t n = 0; n < received; ++n) {
+        uint64_t counter = 0;
+        if (!FrameIsIntact(got.data() + n * OUTPUT_FRAME_BYTES, counter) || (n > 0 && counter <= previous)) {
+            ADD_FAILURE() << "frame at position " << n << " is damaged or out of order (counter " << counter << ")";
+            break;
+        }
+        previous = counter;
+    }
+
+    close(client);
+    gateway.stop();
+}
+
+TEST(GatewayTest, OutputForASessionThatDoesNotExistIsRefusedQuietly) {
+    const NetworkConfig config = GatewayConfig("239.255.1.49", 25249, 47019);
+    FixedFrameHandler handler;
+    TestGateway gateway(handler, config, FreshStorePath("no_such_session"), 1024);
+    gateway.start();
+    const std::string frame = MakeOutputFrame(0);
+    EXPECT_FALSE(gateway.sendToSession(999, frame.data(), frame.size()));
+    EXPECT_EQ(0u, gateway.droppedOutputBytes()) << "an unknown session is not a slow one";
+    gateway.stop();
+}
