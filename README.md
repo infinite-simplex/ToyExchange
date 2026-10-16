@@ -71,11 +71,12 @@ ctest --test-dir build --output-on-failure
 Core primitives only: replica arbitration, telemetry, performance
 aggregation, the ingress recovery path (sequence store, retransmit server,
 multicast receiver — late join, restart, duplicates, lost tails, damaged
-retransmit replies), and the ingress gateway with a stand-in wire protocol
+retransmit replies), the ingress gateway with a stand-in wire protocol
 (sequencing, store-before-multicast, datagram batching, split and broken
-frames). The tests use a stand-in command type. A product repo carries its
-own tests for whatever it builds on top (matching engine, real wire
-protocol). CI runs this on every push.
+frames), and egress (leader-only publishing, epoch fencing, failover to the
+surviving replica). The tests use stand-in command and event types. A
+product repo carries its own tests for whatever it builds on top (matching
+engine, real wire protocol). CI runs this on every push.
 
 ## License
 

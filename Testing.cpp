@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "ReplicaArbiter.hpp"
+#include "ArbiterTestSupport.hpp"
 #include "HeartbeatMessage.hpp"
 #include "Telemetry.hpp"
 #include "TelemetryForwarder.hpp"
@@ -21,30 +22,7 @@
 // ReplicaArbiter — matching-replica leader election / fencing
 // =====================================================================
 
-namespace {
-
-HeartbeatResponse SendHeartbeat(uint16_t arbiterPort, ReplicaId id, uint64_t lastAppliedSeq) {
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    timeval rxTimeout{};
-    rxTimeout.tv_sec = 0;
-    rxTimeout.tv_usec = 500'000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rxTimeout, sizeof(rxTimeout));
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(arbiterPort);
-    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-
-    HeartbeatRequest req{ id, lastAppliedSeq };
-    sendto(sock, &req, sizeof(req), 0, (sockaddr*)&addr, sizeof(addr));
-
-    HeartbeatResponse resp{};
-    recv(sock, &resp, sizeof(resp), 0);
-    close(sock);
-    return resp;
-}
-
-} // namespace
+using arbiter_test::SendHeartbeat;
 
 TEST(ReplicaArbiterTest, FirstEverHeartbeatBecomesLeaderWithEpochOne) {
     ReplicaArbiter arbiter(46001, std::chrono::milliseconds(50));

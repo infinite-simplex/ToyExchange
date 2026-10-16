@@ -20,8 +20,8 @@ namespace detail {
     }
 }
 
-template <typename TProtocolHandler, typename TCommand>
-void NetworkGateway<TProtocolHandler, TCommand>::start() {
+template <typename TProtocolHandler, typename TCommand, typename TFanOut>
+void NetworkGateway<TProtocolHandler, TCommand, TFanOut>::start() {
     if (m_running.load()) return;
 
     m_listenSocket = socket(AF_INET, SOCK_STREAM, 0);
@@ -61,19 +61,14 @@ void NetworkGateway<TProtocolHandler, TCommand>::start() {
         throw std::system_error(errno, std::generic_category(), "Unable to register listen socket with epoll");
     }
 
-    m_mcastFd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (m_mcastFd < 0) {
+    try {
+        m_fanOut.start();
+    }
+    catch (...) {
         close(m_epollFd);
         close(m_listenSocket);
-        throw std::system_error(errno, std::generic_category(), "Unable to create multicast socket");
+        throw;
     }
-    unsigned char ttl = 1;
-    setsockopt(m_mcastFd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
-
-    std::memset(&m_mcastDestAddr, 0, sizeof(m_mcastDestAddr));
-    m_mcastDestAddr.sin_family = AF_INET;
-    m_mcastDestAddr.sin_port = htons(m_config.multicastPort);
-    inet_pton(AF_INET, m_config.multicastIp.c_str(), &m_mcastDestAddr.sin_addr);
 
     m_recordsPerDatagram = RecordsPerDatagram<TCommand>(m_config.ingressDatagramMaxBytes);
     m_batch.clear();
@@ -83,8 +78,8 @@ void NetworkGateway<TProtocolHandler, TCommand>::start() {
     m_ingressThread = std::thread(&NetworkGateway::pollSockets, this);
 }
 
-template <typename TProtocolHandler, typename TCommand>
-void NetworkGateway<TProtocolHandler, TCommand>::stop() {
+template <typename TProtocolHandler, typename TCommand, typename TFanOut>
+void NetworkGateway<TProtocolHandler, TCommand, TFanOut>::stop() {
     if (!m_running.load()) return;
     m_running.store(false);
 
@@ -92,16 +87,15 @@ void NetworkGateway<TProtocolHandler, TCommand>::stop() {
 
     if (m_epollFd != -1) close(m_epollFd);
     if (m_listenSocket != -1) close(m_listenSocket);
-    if (m_mcastFd != -1) close(m_mcastFd);
+    m_fanOut.stop();
 
     m_epollFd = -1;
     m_listenSocket = -1;
-    m_mcastFd = -1;
     m_connBuffers.clear();
 }
 
-template <typename TProtocolHandler, typename TCommand>
-void NetworkGateway<TProtocolHandler, TCommand>::pollSockets() {
+template <typename TProtocolHandler, typename TCommand, typename TFanOut>
+void NetworkGateway<TProtocolHandler, TCommand, TFanOut>::pollSockets() {
     constexpr int MAX_EVENTS = 64;
     epoll_event events[MAX_EVENTS];
 
@@ -189,19 +183,18 @@ void NetworkGateway<TProtocolHandler, TCommand>::pollSockets() {
     }
 }
 
-template <typename TProtocolHandler, typename TCommand>
-void NetworkGateway<TProtocolHandler, TCommand>::flushBatch() {
+template <typename TProtocolHandler, typename TCommand, typename TFanOut>
+void NetworkGateway<TProtocolHandler, TCommand, TFanOut>::flushBatch() {
     if (m_batch.empty()) return;
     // A failed send loses no command: every record is already in the store,
     // so each replica sees the gap and fetches the records through the
     // retransmit server.
-    sendto(m_mcastFd, m_batch.data(), m_batch.size() * sizeof(m_batch[0]), 0,
-        (struct sockaddr*)&m_mcastDestAddr, sizeof(m_mcastDestAddr));
+    m_fanOut.publish(m_batch.data(), m_batch.size() * sizeof(m_batch[0]));
     m_batch.clear();
 }
 
-template <typename TProtocolHandler, typename TCommand>
-void NetworkGateway<TProtocolHandler, TCommand>::closeConnection(int fd) {
+template <typename TProtocolHandler, typename TCommand, typename TFanOut>
+void NetworkGateway<TProtocolHandler, TCommand, TFanOut>::closeConnection(int fd) {
     epoll_ctl(m_epollFd, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
     m_connBuffers.erase(fd);

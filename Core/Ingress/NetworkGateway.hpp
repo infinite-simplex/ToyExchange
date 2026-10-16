@@ -12,6 +12,7 @@
 #include "SequenceStore.hpp"
 #include "SequencedInboundMessage.hpp"
 #include "NetworkConfig.hpp"
+#include "MulticastFanOut.hpp"
 #include "Telemetry.hpp" // get_time(), used in NetworkGateway.inl
 
 struct ConnectionBuffer {
@@ -42,13 +43,16 @@ struct ConnectionBuffer {
 // soon as the datagram is full. Nothing ever waits for more commands to
 // arrive, so a command that arrives alone goes out at once, in a datagram of
 // one record. Every record is appended to the store before its datagram is sent.
-template <typename TProtocolHandler, typename TCommand>
+//
+// TFanOut is how a batch reaches the replicas (see MulticastFanOut.hpp for the
+// required shape). The default is one UDP multicast datagram per batch.
+template <typename TProtocolHandler, typename TCommand, typename TFanOut = MulticastFanOut>
 class NetworkGateway {
 public:
     NetworkGateway(TProtocolHandler& handler, const NetworkConfig& config,
                    const std::string& sequenceStorePath, size_t sequenceStoreCapacity)
         : m_protocolHandler(handler), m_config(config),
-          m_sequenceStore(sequenceStorePath, sequenceStoreCapacity) {
+          m_sequenceStore(sequenceStorePath, sequenceStoreCapacity), m_fanOut(config) {
     }
 
     ~NetworkGateway() { stop(); }
@@ -60,6 +64,10 @@ public:
     // wired to it from outside (gap recovery is a separate process concern,
     // not something NetworkGateway serves itself).
     SequenceStore<TCommand>& sequenceStore() { return m_sequenceStore; }
+
+    // The fan-out, for a caller that needs to ask the transport something its
+    // own type knows (for example, whether any replica is connected yet).
+    const TFanOut& fanOut() const { return m_fanOut; }
 
     // Best-effort private send to whichever live connection owns `id`, called
     // from EgressGateway's thread (not the ingress thread) — the only part of
@@ -97,8 +105,7 @@ private:
 
     int m_listenSocket = -1;
     int m_epollFd = -1;
-    int m_mcastFd = -1;
-    sockaddr_in m_mcastDestAddr{};
+    TFanOut m_fanOut;
 
     static constexpr size_t BUFFER_SIZE = 4096;
     char m_readBuffer[BUFFER_SIZE];

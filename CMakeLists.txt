@@ -32,6 +32,12 @@ FetchContent_MakeAvailable(hdr_histogram)
 add_subdirectory(Core)
 add_subdirectory(PerformanceService)
 
+# Benchmark tools (Benchmarks/). Off by default so CI and consumers do not build them.
+option(TOYEXCHANGE_BENCHMARKS "Build the benchmark tools" OFF)
+if(TOYEXCHANGE_BENCHMARKS)
+    add_subdirectory(Benchmarks)
+endif()
+
 # ==============================================================================
 # Testing Setup (GoogleTest + CTest)
 # ==============================================================================
@@ -45,7 +51,7 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
-add_executable(CoreTests Testing.cpp IngressRecoveryTesting.cpp GatewayTesting.cpp)
+add_executable(CoreTests Testing.cpp IngressRecoveryTesting.cpp GatewayTesting.cpp EgressTesting.cpp)
 target_link_libraries(CoreTests
     PRIVATE
         gtest_main
