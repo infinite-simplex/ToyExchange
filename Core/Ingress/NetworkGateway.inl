@@ -141,10 +141,12 @@ void NetworkGateway<TProtocolHandler, TCommand, TFanOut>::pollSockets() {
             ConnectionBuffer& connBuf = m_connBuffers[currentFd];
             connBuf.append(m_readBuffer, static_cast<size_t>(bytesRead));
 
+            const SessionId sessionId = m_fdToSession[currentFd]; // once per read, not once per command
+
             while (true) {
                 TCommand cmd{};
                 size_t consumed = m_protocolHandler.validateAndParse(
-                    connBuf.m_data.data(), connBuf.m_validBytes, cmd);
+                    connBuf.readPtr(), connBuf.unread(), cmd);
                 if (consumed == TProtocolHandler::PARSE_FATAL_ERROR) {
                     closeConnection(currentFd); // connBuf now dangles (erased below) — don't touch it after this
                     break;
@@ -160,7 +162,7 @@ void NetworkGateway<TProtocolHandler, TCommand, TFanOut>::pollSockets() {
                 // TraceId (see alias.hpp) and the eventual wrap of the arena
                 // ring itself are both safe.
                 cmd.trace_id = static_cast<decltype(cmd.trace_id)>(seq);
-                cmd.sessionId = m_fdToSession[currentFd];
+                cmd.sessionId = sessionId;
 
                 SequencedInboundMessage<TCommand> msg{};
                 msg.sequenceNumber = seq;

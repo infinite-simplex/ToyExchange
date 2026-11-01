@@ -18,16 +18,28 @@
 
 struct ConnectionBuffer {
     std::vector<char> m_data;
-    size_t m_validBytes = 0;
+    size_t m_validBytes = 0; // end of received data
+    size_t m_readPos = 0;    // start of data not yet parsed
+
+    const char* readPtr() const { return m_data.data() + m_readPos; }
+    size_t unread() const { return m_validBytes - m_readPos; }
 
     void append(const char* src, size_t len) {
+        compact();
         if (m_validBytes + len > m_data.size()) m_data.resize(m_validBytes + len);
         std::memcpy(m_data.data() + m_validBytes, src, len);
         m_validBytes += len;
     }
-    void consume(size_t len) {
-        std::memmove(m_data.data(), m_data.data() + len, m_validBytes - len);
-        m_validBytes -= len;
+    // O(1): parsed bytes are dropped from the front by append(), once per recv,
+    // rather than shifting the whole remainder after every frame.
+    void consume(size_t len) { m_readPos += len; }
+
+private:
+    void compact() {
+        if (m_readPos == 0) return;
+        std::memmove(m_data.data(), m_data.data() + m_readPos, unread());
+        m_validBytes = unread();
+        m_readPos = 0;
     }
 };
 
