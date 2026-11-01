@@ -352,7 +352,7 @@ double Median(std::vector<double> v) {
 
 void Usage() {
     std::puts("IngressBench [--transport handwritten] [--replicas N] [--rate CMDS_PER_SEC|0] [--seconds S]\n"
-              "             [--warmup S] [--repeats K] [--spin-us N] [--datagram-bytes N] [--receive-buffer N]\n"
+              "             [--warmup S] [--repeats K] [--spin-us N] [--datagram-bytes N] [--gso-segments N] [--receive-buffer N]\n"
               "             [--driver-pid PID[,PID...]] [--aeron-dir DIR] [--aeron-replica-dirs DIR[,DIR...]]\n"
               "             [--aeron-channel URI] [--aeron-idle busy|backoff]\n"
               "             [--stall-replica N --stall-at S --stall-ms MS]\n"
@@ -377,6 +377,7 @@ int main(int argc, char** argv) {
         else if (arg == "--repeats") opt.repeats = std::atoi(next());
         else if (arg == "--spin-us") opt.spinMicros = static_cast<uint32_t>(std::atoi(next()));
         else if (arg == "--datagram-bytes") opt.datagramBytes = static_cast<size_t>(std::atoll(next()));
+        else if (arg == "--gso-segments") opt.gsoSegments = static_cast<size_t>(std::atoll(next()));
         else if (arg == "--receive-buffer") opt.receiveBufferBytes = std::atoi(next());
         else if (arg == "--driver-pid") {
             for (const std::string& pid : SplitCommaList(next())) opt.driverPids.push_back(std::atoi(pid.c_str()));

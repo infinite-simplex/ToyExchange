@@ -61,8 +61,23 @@ void NetworkGateway<TProtocolHandler, TCommand, TFanOut>::start() {
         throw std::system_error(errno, std::generic_category(), "Unable to register listen socket with epoll");
     }
 
+    m_recordsPerDatagram = RecordsPerDatagram<TCommand>(m_config.ingressDatagramMaxBytes);
+    m_recordsPerSend = m_recordsPerDatagram;
+
     try {
         m_fanOut.start();
+        // A fan-out that can cut one buffer into datagrams (UDP GSO) may be handed several at once.
+        if constexpr (requires(TFanOut& f, size_t n) { f.setSegmentBytes(n); }) {
+            constexpr size_t kMaxGsoSegments = 64;   // UDP_MAX_SEGMENTS
+            constexpr size_t kMaxUdpPayload = 65507; // largest single send
+            const size_t datagramBytes = m_recordsPerDatagram * sizeof(SequencedInboundMessage<TCommand>);
+            const size_t segments = std::min({m_config.ingressGsoSegments, kMaxGsoSegments,
+                                              kMaxUdpPayload / datagramBytes});
+            if (segments > 1) {
+                m_fanOut.setSegmentBytes(datagramBytes);
+                m_recordsPerSend = m_recordsPerDatagram * segments;
+            }
+        }
     }
     catch (...) {
         close(m_epollFd);
@@ -70,9 +85,8 @@ void NetworkGateway<TProtocolHandler, TCommand, TFanOut>::start() {
         throw;
     }
 
-    m_recordsPerDatagram = RecordsPerDatagram<TCommand>(m_config.ingressDatagramMaxBytes);
     m_batch.clear();
-    m_batch.reserve(m_recordsPerDatagram);
+    m_batch.reserve(m_recordsPerSend);
 
     m_running.store(true);
     m_ingressThread = std::thread(&NetworkGateway::pollSockets, this);
@@ -171,7 +185,7 @@ void NetworkGateway<TProtocolHandler, TCommand, TFanOut>::pollSockets() {
                 msg.command = cmd;
                 m_sequenceStore.append(msg); // append before multicast — closes the durability gap
                 m_batch.push_back(msg);
-                if (m_batch.size() == m_recordsPerDatagram) flushBatch();
+                if (m_batch.size() == m_recordsPerSend) flushBatch();
 
                 connBuf.consume(consumed);
             }

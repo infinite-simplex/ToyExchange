@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <mutex>
@@ -56,6 +57,8 @@ private:
 // soon as the datagram is full. Nothing ever waits for more commands to
 // arrive, so a command that arrives alone goes out at once, in a datagram of
 // one record. Every record is appended to the store before its datagram is sent.
+// With NetworkConfig::ingressGsoSegments above 1, up to that many datagrams
+// leave in one send (UDP GSO). Still only what the pass already sequenced.
 //
 // TFanOut is how a batch reaches the replicas (see MulticastFanOut.hpp for the
 // required shape). The default is one UDP multicast datagram per batch.
@@ -214,6 +217,7 @@ private:
     // datagram. Ingress thread only. Capacity is fixed in start().
     std::vector<SequencedInboundMessage<TCommand>> m_batch;
     size_t m_recordsPerDatagram = 1;
+    size_t m_recordsPerSend = 1; // m_recordsPerDatagram, times the datagrams one send carries
     std::unordered_map<int, ConnectionBuffer> m_connBuffers;
 
     // Session bookkeeping for egress routing (see sendToSession above).

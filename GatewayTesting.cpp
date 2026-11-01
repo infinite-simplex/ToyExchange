@@ -339,6 +339,43 @@ TEST(GatewayTest, CommandsFromOneReadShareFewDatagrams) {
     gateway.stop();
 }
 
+TEST(GatewayTest, ASendThatCarriesSeveralDatagramsStillArrivesAsDatagramsWithinTheLimit) {
+    constexpr uint64_t COMMANDS = 70; // well over one send's worth at 4 datagrams a send
+    const size_t recordsPerDatagram = NetworkConfig{}.ingressDatagramMaxBytes / sizeof(TestMessage);
+    ASSERT_GT(recordsPerDatagram, 1u) << "the test record must fit several times in one datagram";
+
+    NetworkConfig config = GatewayConfig("239.255.1.70", 25270, 47030);
+    config.ingressGsoSegments = 4;
+    FixedFrameHandler handler;
+    TestGateway gateway(handler, config, FreshStorePath("gso"), 1024);
+    DatagramTap tap(config, gateway.sequenceStore());
+    SPSCQueue<TestCommand> queue;
+    MulticastIngressReceiver<TestCommand> receiver(queue, config);
+    gateway.start();
+    receiver.start();
+    std::this_thread::sleep_for(GROUP_JOIN_WAIT);
+
+    const int client = Connect(47030);
+    ASSERT_GE(client, 0);
+    WriteFrames(client, 0, COMMANDS);
+
+    ExpectInOrder(Drain(queue, COMMANDS), COMMANDS);
+    // The kernel cuts a multi-datagram send back into datagrams of at most
+    // ingressDatagramMaxBytes. A send that went out whole would show here as a datagram over the limit.
+    size_t records = 0;
+    const std::vector<size_t> perDatagram = tap.recordsPerDatagram();
+    for (size_t count : perDatagram) {
+        EXPECT_LE(count, recordsPerDatagram) << "a datagram is larger than ingressDatagramMaxBytes";
+        records += count;
+    }
+    EXPECT_EQ(COMMANDS, records);
+    EXPECT_GE(perDatagram.size(), (COMMANDS + recordsPerDatagram - 1) / recordsPerDatagram);
+
+    close(client);
+    receiver.stop();
+    gateway.stop();
+}
+
 TEST(GatewayTest, ACommandThatArrivesAloneIsSentAtOnceAndNeverWaitsForOthers) {
     const NetworkConfig config = GatewayConfig("239.255.1.46", 25246, 47016);
     FixedFrameHandler handler;

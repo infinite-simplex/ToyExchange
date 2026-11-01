@@ -42,6 +42,9 @@ Other scenarios:
 
 - `--stall-replica N --stall-at S --stall-ms MS` pauses replica N's consumer, like a slow matching thread.
 - `--late-start-replica N --late-start-ms MS` starts replica N's receiver after the stream is under way.
+- `--gso-segments N` lets one send carry up to N datagrams (UDP GSO; the kernel cuts them back into
+  `--datagram-bytes` datagrams). Default 1: one send per datagram. Above about 5M commands/s the receivers
+  fall behind and the run gives up, so raise it only to the rate you need.
 
 ### Transports
 

@@ -52,6 +52,14 @@ struct NetworkConfig {
     // the path MTU is 65,536, a larger value is safe.
     size_t ingressDatagramMaxBytes = DEFAULT_DATAGRAM_MAX_BYTES;
 
+    // Most datagrams one send may carry. 1 (the default) is one sendto per datagram. Above 1,
+    // the gateway hands the kernel up to this many datagrams of back-to-back records in a single
+    // send and the kernel splits them (UDP GSO), so the sender pays for the trip through the
+    // network stack once per send instead of once per datagram. Each datagram on the wire is
+    // still ingressDatagramMaxBytes at most, so loss and recovery behave as before. Nothing
+    // waits for a send to fill: only what is already sequenced goes out, at the end of the pass.
+    size_t ingressGsoSegments = 1;
+
     // Receiver spin window, in microseconds. 0 (the default) means
     // MulticastIngressReceiver blocks in recv() between datagrams. A value N
     // above 0 means that after each datagram it polls the socket for up to N

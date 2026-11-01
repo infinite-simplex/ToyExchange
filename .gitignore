@@ -19,6 +19,10 @@ Makefile
 *.pdb
 compile_commands.json
 
+# Clion
+.idea/
+idea/
+
 # Visual Studio / VS Code
 .vs/
 .vscode/

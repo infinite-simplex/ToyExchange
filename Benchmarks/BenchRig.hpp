@@ -51,6 +51,7 @@ struct Options {
     int repeats = 3;
     uint32_t spinMicros = 0;   // receiver spin window (handwritten transport)
     size_t datagramBytes = DEFAULT_DATAGRAM_MAX_BYTES;
+    size_t gsoSegments = 1;    // datagrams per send (UDP GSO); 1 = one sendto per datagram
     int receiveBufferBytes = 4 * 1024 * 1024;
     std::vector<int> driverPids; // external media drivers to include in CPU accounting
     std::string aeronDir;      // transports that need an external driver: the gateway's
@@ -82,6 +83,7 @@ inline NetworkConfig MakeNetworkConfig(const Options& opt) {
     cfg.ingressIdleProbe = false;
     cfg.ingressSpinMicros = opt.spinMicros;
     cfg.ingressDatagramMaxBytes = opt.datagramBytes;
+    cfg.ingressGsoSegments = opt.gsoSegments;
     cfg.ingressReceiveBufferBytes = opt.receiveBufferBytes;
     return cfg;
 }
