@@ -7,6 +7,7 @@
 #include <ctime>
 #include <x86intrin.h>
 #include "Alias.hpp"
+#include "TscClock.hpp"
 
 struct alignas(64) OrderTrace {
     // Written by Ingress Server Thread. ingress_tai_ns is stamped on the
@@ -71,9 +72,7 @@ static inline uint64_t get_time() noexcept {
 // another machine's) depends on a running chrony/ptp4l instance
 // disciplining the kernel clock — see Tools/ptp/.
 static inline uint64_t get_synced_time_ns() noexcept {
-    struct timespec ts;
-    clock_gettime(CLOCK_TAI, &ts);
-    return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ull + static_cast<uint64_t>(ts.tv_nsec);
+    return tscclock::g_clock.now_ns(); // calibrated TSC; falls back to clock_gettime(CLOCK_TAI) -- see TscClock.hpp
 }
 
 // Sized for ~1M orders/day (rounded up to a power of 2) so a full trading

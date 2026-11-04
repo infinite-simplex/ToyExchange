@@ -51,7 +51,7 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
-add_executable(CoreTests Testing.cpp IngressRecoveryTesting.cpp GatewayTesting.cpp EgressTesting.cpp)
+add_executable(CoreTests Testing.cpp IngressRecoveryTesting.cpp GatewayTesting.cpp EgressTesting.cpp TscClockTesting.cpp)
 target_link_libraries(CoreTests
     PRIVATE
         gtest_main
