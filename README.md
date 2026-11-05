@@ -52,8 +52,8 @@ failover without any hand-over of state. In practice:
 
 ## Building and running
 
-Linux only (uses `epoll`, `mmap`, multicast sockets, `CLOCK_TAI` directly —
-on Windows, build under WSL). This repo alone only builds `Core` and
+Linux on x86-64 only (uses `epoll`, `mmap`, multicast sockets and a calibrated
+TSC clock that falls back to `CLOCK_TAI` — on Windows, build under WSL). This repo alone only builds `Core` and
 `PerformanceService`; there's no standalone executable here — see a product
 repo (e.g. EventContractLOB) to run the exchange end to end.
 
@@ -72,8 +72,9 @@ Core primitives only: replica arbitration, telemetry, performance
 aggregation, the ingress recovery path (sequence store, retransmit server,
 multicast receiver — late join, restart, duplicates, lost tails, damaged
 retransmit replies), the ingress gateway with a stand-in wire protocol
-(sequencing, store-before-multicast, datagram batching, split and broken
-frames, a client whose socket is full), and egress (batched leader-only
+(sequencing, store-before-multicast, datagram batching, multi-datagram sends,
+split and broken frames, a client whose socket is full), the calibrated TSC clock
+(scripted slews, steps and a preempted calibrator, plus the real clock), and egress (batched leader-only
 publishing, epoch fencing, ordinal accounting and loss reports, failover to the
 surviving replica). The tests use stand-in command and event types. A
 product repo carries its own tests for whatever it builds on top (matching
